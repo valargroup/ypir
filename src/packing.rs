@@ -1276,6 +1276,106 @@ mod test {
 
     use super::*;
 
+    /// Fills every NTT slot of `m` with `val`, ignoring CRT modulus bounds.
+    fn fill_all(m: &mut PolyMatrixNTT, val: u64) {
+        for v in m.as_mut_slice().iter_mut() {
+            *v = val;
+        }
+    }
+
+    /// Demonstrates the overflow in `multiply_no_reduce` (poly.rs L631)
+    /// directly, using worst-case inputs.
+    ///
+    /// With every slot set to `2^{34}`, a single product is `2^{68}` which
+    /// overflows u64 on the multiplication itself.
+    ///
+    /// Must be compiled in **debug** mode (`cargo test` without `--release`)
+    /// because `multiply_no_reduce` uses plain `+=`/`*` which only panics on
+    /// overflow in debug builds.
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_multiply_no_reduce_overflow_direct() {
+        let params = get_test_params();
+        let t = params.t_exp_left;
+        let mut a = PolyMatrixNTT::zero(&params, 2, t);
+        let mut b = PolyMatrixNTT::zero(&params, t, 1);
+        let mut res = PolyMatrixNTT::zero(&params, 2, 1);
+        fill_all(&mut a, 1u64 << 34);
+        fill_all(&mut b, 1u64 << 34);
+        multiply_no_reduce(&mut res, &a, &b, 0);
+    }
+
+    /// Triggers the overflow through `precompute_pack` by providing
+    /// fake_pub_params whose values far exceed the NTT modulus.
+    ///
+    /// `multiply_no_reduce` performs `res[z] += pub_param[z] * ginv[z]`
+    /// without checking that the operands are reduced.  When pub_param
+    /// values are `2^{34}` and ginv values are normal NTT residues
+    /// (< 2^{28}), a single product reaches `2^{62}` and the sum of
+    /// `t_exp_left = 8` products overflows u64.
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_precompute_pack_overflow() {
+        let params = get_test_params();
+        let y_constants = generate_y_constants(&params);
+
+        let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
+
+        let fake_pub_params: Vec<PolyMatrixNTT> = (0..params.poly_len_log2)
+            .map(|_| {
+                let mut m = PolyMatrixNTT::zero(&params, 2, params.t_exp_left);
+                fill_all(&mut m, 1u64 << 34);
+                m
+            })
+            .collect();
+
+        let v_ct: Vec<PolyMatrixNTT> = (0..params.poly_len)
+            .map(|_| PolyMatrixNTT::random_rng(&params, 2, 1, &mut rng))
+            .collect();
+
+        let _ = precompute_pack(
+            &params,
+            params.poly_len_log2,
+            &v_ct,
+            &fake_pub_params,
+            &y_constants,
+        );
+    }
+
+    /// Same idea for `pack_lwes` → `pack_lwes_inner_non_recursive`.
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_pack_lwes_inner_non_recursive_overflow() {
+        let params = get_test_params();
+        let y_constants = generate_y_constants(&params);
+
+        let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
+
+        let pub_params: Vec<PolyMatrixNTT> = (0..params.poly_len_log2)
+            .map(|_| {
+                let mut m = PolyMatrixNTT::zero(&params, 2, params.t_exp_left);
+                fill_all(&mut m, 1u64 << 34);
+                m
+            })
+            .collect();
+
+        let v_ct: Vec<PolyMatrixNTT> = (0..params.poly_len)
+            .map(|_| PolyMatrixNTT::random_rng(&params, 2, 1, &mut rng))
+            .collect();
+
+        let b_values: Vec<u64> = (0..params.poly_len as u64).collect();
+
+        let _ = pack_lwes(
+            &params,
+            &b_values,
+            &v_ct,
+            &[],
+            params.poly_len,
+            &pub_params,
+            &y_constants,
+        );
+    }
+
     #[test]
     fn test_packing() {
         let params = get_test_params();
