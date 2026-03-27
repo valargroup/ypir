@@ -811,3 +811,556 @@ mod test {
         assert_eq!(result, pt);
     }
 }
+
+#[cfg(test)]
+mod malformed_response_tests {
+    use super::*;
+    use crate::params::{params_for_scenario, GetQPrime, GetRho};
+
+    fn make_test_params() -> Params {
+        params_for_scenario(1 << 20, 1)
+    }
+
+    fn make_yclient_from_seed(params: &Params, seed: Seed) -> (Client, Seed) {
+        let mut client = Client::init(params);
+        client.generate_secret_keys_from_seed(seed);
+        (client, seed)
+    }
+
+    fn fixed_seed() -> Seed {
+        [42u8; 32]
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for YClient::decode_response (the simplified LWE decode)
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[should_panic]
+    fn decode_response_empty_input_panics() {
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+        let empty: Vec<u64> = vec![];
+        let _ = y_client.decode_response(&empty);
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_response_truncated_input_panics() {
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+
+        let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+        let expected_len = (params.poly_len + 1) * db_cols;
+        let truncated = vec![0u64; expected_len / 2];
+        let _ = y_client.decode_response(&truncated);
+    }
+
+    #[test]
+    fn decode_response_all_zeros() {
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+
+        let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+        let expected_len = (params.poly_len + 1) * db_cols;
+        let zeros = vec![0u64; expected_len];
+        let result = y_client.decode_response(&zeros);
+        assert_eq!(result.len(), db_cols);
+        for val in &result {
+            assert_eq!(*val, 0);
+        }
+    }
+
+    #[test]
+    fn decode_response_max_modular_values_does_not_panic() {
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+
+        let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+        let expected_len = (params.poly_len + 1) * db_cols;
+        let max_vals = vec![params.modulus - 1; expected_len];
+        let result = y_client.decode_response(&max_vals);
+        assert_eq!(result.len(), db_cols);
+    }
+
+    #[test]
+    fn decode_response_u64_max_overflows_accumulator() {
+        // u64::MAX values overflow the u128 accumulator in decode_response
+        // because poly_len * (u64::MAX)^2 > u128::MAX. This documents that
+        // decode_response assumes inputs are < params.modulus.
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+
+        let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+        let expected_len = (params.poly_len + 1) * db_cols;
+        let ones = vec![u64::MAX; expected_len];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            y_client.decode_response(&ones)
+        }));
+        assert!(
+            result.is_err(),
+            "u64::MAX inputs should overflow the u128 accumulator"
+        );
+    }
+
+    #[test]
+    fn decode_response_oversized_input_returns_correct_length() {
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+
+        let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+        let expected_len = (params.poly_len + 1) * db_cols;
+        let oversized = vec![0u64; expected_len + 1000];
+        let result = y_client.decode_response(&oversized);
+        assert_eq!(result.len(), db_cols);
+    }
+
+    #[test]
+    fn decode_response_random_data_does_not_panic() {
+        let params = make_test_params();
+        let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, seed);
+
+        let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+        let expected_len = (params.poly_len + 1) * db_cols;
+        let random_data: Vec<u64> = (0..expected_len)
+            .map(|_| fastrand::u64(..) % params.modulus)
+            .collect();
+        let result = y_client.decode_response(&random_data);
+        assert_eq!(result.len(), db_cols);
+        for val in &result {
+            assert!(*val < params.pt_modulus, "output exceeds plaintext modulus");
+        }
+    }
+
+    #[test]
+    fn decode_response_deterministic_across_calls() {
+        let params = make_test_params();
+        let seed = fixed_seed();
+
+        let result1 = {
+            let (mut client, seed) = make_yclient_from_seed(&params, seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+            let expected_len = (params.poly_len + 1) * db_cols;
+            let data: Vec<u64> = (0..expected_len).map(|i| (i as u64 * 7) % params.modulus).collect();
+            y_client.decode_response(&data)
+        };
+
+        let result2 = {
+            let (mut client, seed) = make_yclient_from_seed(&params, seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            let db_cols = 1usize << (params.db_dim_2 + params.poly_len_log2);
+            let expected_len = (params.poly_len + 1) * db_cols;
+            let data: Vec<u64> = (0..expected_len).map(|i| (i as u64 * 7) % params.modulus).collect();
+            y_client.decode_response(&data)
+        };
+
+        assert_eq!(result1, result2, "decode_response must be deterministic for the same seed and input");
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for YPIRClient::decode_response_normal_yclient
+    // (the full RLWE→LWE decode pipeline)
+    // ---------------------------------------------------------------
+
+    fn expected_normal_response_byte_len(params: &Params) -> usize {
+        let num_rlwe_outputs = params.rho();
+        let q_prime_1 = params.get_q_prime_1();
+        let q_prime_2 = params.get_q_prime_2();
+        let q_1_bits = (q_prime_2 as f64).log2().ceil() as usize;
+        let q_2_bits = (q_prime_1 as f64).log2().ceil() as usize;
+        let per_ct_bits = (q_1_bits + q_2_bits) * params.poly_len;
+        let per_ct_bytes = (per_ct_bits + 7) / 8;
+        per_ct_bytes * num_rlwe_outputs
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_normal_empty_response_panics() {
+        let params = make_test_params();
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_normal_yclient(&params, &y_client, &[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_normal_single_byte_panics() {
+        let params = make_test_params();
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_normal_yclient(&params, &y_client, &[0xFF]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_normal_misaligned_length_panics() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+        let misaligned = vec![0u8; expected_len + 1];
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_normal_yclient(&params, &y_client, &misaligned);
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_normal_truncated_response_panics() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+        let truncated = vec![0u8; expected_len / 2];
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_normal_yclient(&params, &y_client, &truncated);
+    }
+
+    #[test]
+    fn decode_normal_all_zeros_does_not_leak_via_panic() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+        let zeros = vec![0u8; expected_len];
+
+        let seed_a = [1u8; 32];
+        let seed_b = [2u8; 32];
+
+        let result_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_a);
+            let y_client = YClient::from_seed(&mut client, &params, seed_a);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &zeros)
+        }));
+
+        let result_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_b);
+            let y_client = YClient::from_seed(&mut client, &params, seed_b);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &zeros)
+        }));
+
+        assert_eq!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "All-zeros response must produce the same success/failure outcome regardless of secret key \
+             (selective failure = side channel)"
+        );
+    }
+
+    #[test]
+    fn decode_normal_random_response_same_outcome_different_keys() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+        let random_resp: Vec<u8> = (0..expected_len).map(|_| fastrand::u8(..)).collect();
+
+        let seed_a = [10u8; 32];
+        let seed_b = [20u8; 32];
+
+        let result_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_a);
+            let y_client = YClient::from_seed(&mut client, &params, seed_a);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &random_resp)
+        }));
+
+        let result_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_b);
+            let y_client = YClient::from_seed(&mut client, &params, seed_b);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &random_resp)
+        }));
+
+        assert_eq!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "Random adversarial response must produce the same success/failure outcome regardless of \
+             secret key (selective failure = side channel)"
+        );
+    }
+
+    /// KNOWN VULNERABILITY: This test demonstrates a selective-failure side channel.
+    /// The `assert!(val < lwe_q_prime)` checks in `decode_response_normal_yclient`
+    /// (lines 718-723, 731-736) cause panics whose occurrence depends on the secret
+    /// key. A malicious server can craft responses where some keys panic and others
+    /// don't, leaking 1 bit of secret-key-dependent information per query.
+    ///
+    /// Fix: Replace the assertions with saturating/wrapping arithmetic or return
+    /// a Result, ensuring the code path is identical regardless of the secret key.
+    #[test]
+    #[ignore = "documents selective-failure side channel (known vulnerability)"]
+    fn decode_normal_max_value_bytes_same_outcome_different_keys() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+        let max_resp = vec![0xFFu8; expected_len];
+
+        let seed_a = [30u8; 32];
+        let seed_b = [40u8; 32];
+
+        let result_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_a);
+            let y_client = YClient::from_seed(&mut client, &params, seed_a);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &max_resp)
+        }));
+
+        let result_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_b);
+            let y_client = YClient::from_seed(&mut client, &params, seed_b);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &max_resp)
+        }));
+
+        assert_eq!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "Max-value response must produce the same success/failure outcome regardless of \
+             secret key (selective failure = side channel)"
+        );
+    }
+
+    #[test]
+    fn decode_normal_deterministic_for_same_seed() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+        let response: Vec<u8> = (0..expected_len).map(|i| (i % 256) as u8).collect();
+        let seed = fixed_seed();
+
+        let result1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &response)
+        }));
+
+        let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            YPIRClient::decode_response_normal_yclient(&params, &y_client, &response)
+        }));
+
+        match (result1, result2) {
+            (Ok(v1), Ok(v2)) => assert_eq!(v1, v2, "Decoding the same response with the same seed must be deterministic"),
+            (Err(_), Err(_)) => {} // both panicked -- consistent
+            _ => panic!("Inconsistent panic behavior across identical decode calls"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for YPIRClient::decode_response_simplepir_yclient
+    // ---------------------------------------------------------------
+
+    fn make_simplepir_params() -> Params {
+        crate::params::params_for_scenario_simplepir(1 << 14, 2048 * 14)
+    }
+
+    fn expected_simplepir_response_byte_len(params: &Params) -> usize {
+        let db_cols = params.instances * params.poly_len;
+        let num_rlwe_outputs = db_cols / params.poly_len;
+        let q_prime_1 = params.get_q_prime_1();
+        let q_prime_2 = params.get_q_prime_2();
+        let q_1_bits = (q_prime_2 as f64).log2().ceil() as usize;
+        let q_2_bits = (q_prime_1 as f64).log2().ceil() as usize;
+        let per_ct_bits = (q_1_bits + q_2_bits) * params.poly_len;
+        let per_ct_bytes = (per_ct_bits + 7) / 8;
+        per_ct_bytes * num_rlwe_outputs
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_simplepir_empty_response_panics() {
+        let params = make_simplepir_params();
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_simplepir_truncated_response_panics() {
+        let params = make_simplepir_params();
+        let expected_len = expected_simplepir_response_byte_len(&params);
+        let truncated = vec![0u8; expected_len / 2];
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &truncated);
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_simplepir_misaligned_length_panics() {
+        let params = make_simplepir_params();
+        let expected_len = expected_simplepir_response_byte_len(&params);
+        let misaligned = vec![0u8; expected_len + 1];
+        let mut client = Client::init(&params);
+        client.generate_secret_keys_from_seed(fixed_seed());
+        let y_client = YClient::from_seed(&mut client, &params, fixed_seed());
+        let _ = YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &misaligned);
+    }
+
+    #[test]
+    fn decode_simplepir_all_zeros_does_not_leak_via_panic() {
+        let params = make_simplepir_params();
+        let expected_len = expected_simplepir_response_byte_len(&params);
+        let zeros = vec![0u8; expected_len];
+
+        let seed_a = [1u8; 32];
+        let seed_b = [2u8; 32];
+
+        let result_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_a);
+            let y_client = YClient::from_seed(&mut client, &params, seed_a);
+            YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &zeros)
+        }));
+
+        let result_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_b);
+            let y_client = YClient::from_seed(&mut client, &params, seed_b);
+            YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &zeros)
+        }));
+
+        assert_eq!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "All-zeros SimplePIR response must produce the same success/failure outcome \
+             regardless of secret key"
+        );
+    }
+
+    #[test]
+    fn decode_simplepir_random_response_same_outcome_different_keys() {
+        let params = make_simplepir_params();
+        let expected_len = expected_simplepir_response_byte_len(&params);
+        let random_resp: Vec<u8> = (0..expected_len).map(|_| fastrand::u8(..)).collect();
+
+        let seed_a = [10u8; 32];
+        let seed_b = [20u8; 32];
+
+        let result_a = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_a);
+            let y_client = YClient::from_seed(&mut client, &params, seed_a);
+            YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &random_resp)
+        }));
+
+        let result_b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed_b);
+            let y_client = YClient::from_seed(&mut client, &params, seed_b);
+            YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &random_resp)
+        }));
+
+        assert_eq!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "Random adversarial SimplePIR response must produce the same success/failure outcome \
+             regardless of secret key"
+        );
+    }
+
+    #[test]
+    fn decode_simplepir_deterministic_for_same_seed() {
+        let params = make_simplepir_params();
+        let expected_len = expected_simplepir_response_byte_len(&params);
+        let response: Vec<u8> = (0..expected_len).map(|i| (i % 256) as u8).collect();
+        let seed = fixed_seed();
+
+        let result1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &response)
+        }));
+
+        let result2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            YPIRClient::decode_response_simplepir_yclient(&params, &y_client, &response)
+        }));
+
+        match (result1, result2) {
+            (Ok(v1), Ok(v2)) => assert_eq!(v1, v2, "SimplePIR decoding must be deterministic for the same seed and input"),
+            (Err(_), Err(_)) => {},
+            _ => panic!("Inconsistent panic behavior across identical decode calls"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for YPIRClient high-level decode wrappers
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[should_panic]
+    fn ypirclient_decode_normal_empty() {
+        let ypir_client = YPIRClient::from_db_sz(1u64 << 20, 1, false);
+        let _ = ypir_client.decode_response_normal(fixed_seed(), &[]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ypirclient_decode_simplepir_empty() {
+        let ypir_client = YPIRClient::from_db_sz(1 << 14, 2048 * 14, true);
+        let _ = ypir_client.decode_response_simplepir(fixed_seed(), &[]);
+    }
+
+    // ---------------------------------------------------------------
+    // Selective failure oracle tests: an adversary crafts a response
+    // that triggers a range-check assertion only for certain secret
+    // keys. The outcome (panic vs success) must be key-independent.
+    // ---------------------------------------------------------------
+
+    /// KNOWN VULNERABILITY: This test demonstrates a selective-failure side channel.
+    /// A crafted response (0x7F bytes) causes the `assert!(val < lwe_q_prime)` check
+    /// in `decode_response_normal_yclient` to panic for some secret keys but succeed
+    /// for others. Observed outcome across 5 keys: [false, false, true, false, false].
+    /// A malicious server can exploit this to distinguish keys via panic/success
+    /// observation.
+    ///
+    /// Fix: Replace the assertions with constant-time error handling that does not
+    /// branch on secret-dependent values.
+    #[test]
+    #[ignore = "documents selective-failure side channel (known vulnerability)"]
+    fn decode_normal_crafted_near_boundary_same_outcome() {
+        let params = make_test_params();
+        let expected_len = expected_normal_response_byte_len(&params);
+
+        let crafted = vec![0x7Fu8; expected_len];
+
+        let seeds: Vec<Seed> = (0..5u8).map(|i| [i + 50; 32]).collect();
+
+        let outcomes: Vec<bool> = seeds
+            .iter()
+            .map(|seed| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut client = Client::init(&params);
+                    client.generate_secret_keys_from_seed(*seed);
+                    let y_client = YClient::from_seed(&mut client, &params, *seed);
+                    YPIRClient::decode_response_normal_yclient(&params, &y_client, &crafted)
+                }))
+                .is_ok()
+            })
+            .collect();
+
+        let all_same = outcomes.windows(2).all(|w| w[0] == w[1]);
+        assert!(
+            all_same,
+            "Crafted boundary response produced different panic/success outcomes across keys: {:?}. \
+             This indicates a selective-failure side channel.",
+            outcomes
+        );
+    }
+}
