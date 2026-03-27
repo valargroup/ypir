@@ -545,7 +545,7 @@ impl<R: Read + Seek> Iterator for FilePtIter<R> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod test {
     use std::io::Cursor;
 
