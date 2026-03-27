@@ -240,12 +240,6 @@ pub fn measure_noise_width_squared<'a>(
 
 #[cfg(test)]
 mod tests {
-    use spiral_rs::arith::barrett_reduction_u128;
-
-    use super::super::{
-        client::{decrypt_ct_reg_measured, YClient},
-        constants::*,
-    };
     use super::*;
 
     #[test]
@@ -272,42 +266,5 @@ mod tests {
         debug!("total_log2_delta: {}", total_log2_delta);
 
         assert!(total_log2_delta < -40.);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_linear_accumulation_noise() {
-        let params = params_for_scenario(1 << 43, 1);
-        let upper_n = 1 << (11 + 6);
-
-        let mut client = Client::init(&params);
-        client.generate_secret_keys();
-        let y_client = YClient::new(&mut client, &params);
-        let target_idx = 0;
-        let query = y_client.generate_query(SEED_0, params.db_dim_1, false, target_idx);
-
-        let db = (0..upper_n)
-            .map(|_| fastrand::u64(0..params.pt_modulus))
-            .collect::<Vec<_>>();
-
-        let mut acc = vec![0u128; params.poly_len + 1];
-        for idx in 0..upper_n {
-            for dim in 0..params.poly_len + 1 {
-                let query_val = query[dim * upper_n + idx];
-                let db_val = db[idx];
-                let product = query_val as u128 * db_val as u128;
-                acc[dim] += product;
-            }
-        }
-
-        let mut ct = PolyMatrixRaw::zero(&params, 2, 1);
-        for dim in 0..params.poly_len + 1 {
-            ct.data[dim] = barrett_reduction_u128(&params, acc[dim]);
-        }
-
-        let _plaintext =
-            decrypt_ct_reg_measured(y_client.client(), &params, &ct.ntt(), params.poly_len);
-        todo!("problem w test: negacyclic");
-        // assert_eq!(plaintext.data[0], db[target_idx]);
     }
 }

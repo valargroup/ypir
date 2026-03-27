@@ -4,7 +4,7 @@ use log::debug;
 use rand::{thread_rng, Rng};
 
 use spiral_rs::aligned_memory::AlignedMemory64;
-use spiral_rs::{client::*, params::*};
+use spiral_rs::params::*;
 
 use crate::noise_analysis::YPIRSchemeParams;
 
@@ -108,9 +108,9 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
         let mut online_upload_bytes = 0;
         let mut queries = Vec::new();
 
-        let mut clients = (0..K).map(|_| Client::init(&params)).collect::<Vec<_>>();
+        let ypir_client = YPIRClient::new(&params);
 
-        for (_batch, client) in (0..K).zip(clients.iter_mut()) {
+        for _batch in 0..K {
             let target_idx: usize = rng.gen::<usize>() % (db_rows * db_cols);
             let target_row = target_idx / db_cols;
             let target_col = target_idx % db_cols;
@@ -120,11 +120,8 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
             );
 
             let start = Instant::now();
-            client.generate_secret_keys();
-
-            let y_client = YClient::new(client, &params);
-            let (packed_query_row, pack_pub_params_row_1s) =
-                y_client.generate_full_query_simplepir(target_idx as u64);
+            let ((packed_query_row, pack_pub_params_row_1s), client_seed) =
+                ypir_client.generate_query_simplepir(target_row);
 
             let query_size = ((packed_query_row.len() as f64 * params.modulus_log2 as f64) / 8.0)
                 .ceil() as usize;
@@ -138,7 +135,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
             debug!("Query size: {} bytes", online_upload_bytes);
 
             queries.push((
-                y_client,
+                client_seed,
                 target_idx,
                 packed_query_row,
                 pack_pub_params_row_1s,
@@ -171,7 +168,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
         let online_download_bytes = get_size_bytes(&[responses.clone()]); // TODO: this is not quite right for multiple clients
 
         // check correctness
-        for (response_switched, (y_client, target_idx, _, _)) in
+        for (response_switched, (client_seed, target_idx, _, _)) in
             responses.iter().zip(queries.iter())
         {
             let (target_row, _target_col) = (target_idx / db_cols, target_idx % db_cols);
@@ -188,11 +185,8 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
             // debug!("log2_expected_outer_noise: {}", log2_expected_outer_noise);
 
             let start_decode = Instant::now();
-            let final_result = YPIRClient::decode_response_simplepir_yclient(
-                &params,
-                &y_client,
-                response_switched,
-            );
+            let final_result =
+                ypir_client.decode_response_simplepir_raw(*client_seed, response_switched);
             measurement.online.client_decode_time_ms = start_decode.elapsed().as_millis() as usize;
 
             // debug!("got      {:?}", &final_result[..256]);
@@ -363,9 +357,9 @@ pub fn run_ypir_on_params<const K: usize>(
         let mut online_upload_bytes = 0;
         let mut queries = Vec::new();
 
-        let mut clients = (0..K).map(|_| Client::init(&params)).collect::<Vec<_>>();
+        let ypir_client = YPIRClient::new(&params);
 
-        for (_batch, client) in (0..K).zip(clients.iter_mut()) {
+        for _batch in 0..K {
             let target_idx: usize = rng.gen::<usize>() % (db_rows * db_cols);
             // let target_row = target_idx / db_cols;
             // let target_col = target_idx % db_cols;
@@ -375,11 +369,8 @@ pub fn run_ypir_on_params<const K: usize>(
             // );
 
             let start = Instant::now();
-            client.generate_secret_keys();
-
-            let y_client = YClient::new(client, &params);
-            let (packed_query_row_u32, packed_query_col, pack_pub_params_row_1s) =
-                y_client.generate_full_query(target_idx);
+            let ((packed_query_row_u32, packed_query_col, pack_pub_params_row_1s), client_seed) =
+                ypir_client.generate_query_normal(target_idx);
 
             let query_size = packed_query_row_u32.len() * 4 + packed_query_col.len() * 8;
             let pub_params_size = pack_pub_params_row_1s.len() * params.modulus_log2 as usize / 8;
@@ -391,7 +382,7 @@ pub fn run_ypir_on_params<const K: usize>(
             debug!("Query size: {} bytes", online_upload_bytes);
 
             queries.push((
-                y_client,
+                client_seed,
                 target_idx,
                 packed_query_row_u32,
                 packed_query_col,
@@ -428,7 +419,7 @@ pub fn run_ypir_on_params<const K: usize>(
         let online_download_bytes = get_size_bytes(&[responses.clone()]); // TODO: this is not quite right for multiple clients
 
         // check correctness
-        for (response_switched, (y_client, target_idx, _, _, _)) in
+        for (response_switched, (client_seed, target_idx, _, _, _)) in
             responses.iter().zip(queries.iter())
         {
             let corr_result = y_server.get_elem(*target_idx).to_u64();
@@ -440,7 +431,7 @@ pub fn run_ypir_on_params<const K: usize>(
             debug!("log2_expected_outer_noise: {}", log2_expected_outer_noise);
 
             let final_result =
-                YPIRClient::decode_response_normal_yclient(&params, y_client, &response_switched);
+                ypir_client.decode_response_normal(*client_seed, &response_switched);
 
             debug!("got {}, expected {}", final_result, corr_result);
             // debug!("was correct? {}", final_result == corr_result);
