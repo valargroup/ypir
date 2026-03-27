@@ -172,7 +172,7 @@ pub fn generate_matrix_ring(
 }
 
 impl<'a> YClient<'a> {
-    pub fn new(inner: &'a mut Client<'a>, params: &'a Params) -> Self {
+    pub(crate) fn new(inner: &'a mut Client<'a>, params: &'a Params) -> Self {
         Self {
             inner,
             params,
@@ -180,7 +180,7 @@ impl<'a> YClient<'a> {
         }
     }
 
-    pub fn from_seed(inner: &'a mut Client<'a>, params: &'a Params, client_seed: Seed) -> Self {
+    fn from_seed(inner: &'a mut Client<'a>, params: &'a Params, client_seed: Seed) -> Self {
         Self {
             inner,
             params,
@@ -188,7 +188,7 @@ impl<'a> YClient<'a> {
         }
     }
 
-    pub fn lwe_client(&self) -> &LWEClient {
+    fn lwe_client(&self) -> &LWEClient {
         &self.lwe_client
     }
 
@@ -200,7 +200,7 @@ impl<'a> YClient<'a> {
         concat_horizontal(&v, self.params.poly_len + 1, self.params.poly_len)
     }
 
-    pub fn generate_query_impl(
+    pub(crate) fn generate_query_impl(
         &self,
         public_seed_idx: u8,
         dim_log2: usize,
@@ -309,7 +309,7 @@ impl<'a> YClient<'a> {
         out
     }
 
-    pub fn generate_query(
+    fn generate_query(
         &self,
         public_seed_idx: u8,
         dim_log2: usize,
@@ -352,7 +352,7 @@ impl<'a> YClient<'a> {
         }
     }
 
-    pub fn generate_query_lwe_low_mem(
+    fn generate_query_lwe_low_mem(
         &self,
         public_seed_idx: u8,
         dim_log2: usize,
@@ -414,7 +414,7 @@ impl<'a> YClient<'a> {
         out
     }
 
-    pub fn generate_full_query(
+    fn generate_full_query(
         &self,
         target_idx: usize,
     ) -> (Vec<u32>, AlignedMemory64, AlignedMemory64) {
@@ -492,7 +492,7 @@ impl<'a> YClient<'a> {
         )
     }
 
-    pub fn generate_full_query_simplepir(
+    fn generate_full_query_simplepir(
         &self,
         target_idx: u64,
     ) -> (AlignedMemory64, AlignedMemory64) {
@@ -559,7 +559,7 @@ impl<'a> YClient<'a> {
         self.lwe_client().lwe_params()
     }
 
-    pub fn decode_response(&self, response: &[u64]) -> Vec<u64> {
+    fn decode_response(&self, response: &[u64]) -> Vec<u64> {
         debug!("Decoding response: {:?}", &response[..16]);
         let db_cols = 1 << (self.params.db_dim_2 + self.params.poly_len_log2);
 
@@ -584,7 +584,7 @@ impl<'a> YClient<'a> {
         out
     }
 
-    pub fn client(&self) -> &Client<'a> {
+    fn client(&self) -> &Client<'a> {
         self.inner
     }
 }
@@ -659,16 +659,22 @@ impl YPIRClient {
     }
 
     pub fn decode_response_simplepir(&self, client_seed: Seed, response_data: &[u8]) -> Vec<u8> {
+        let decoded = self.decode_response_simplepir_raw(client_seed, response_data);
+        u64s_to_contiguous_bytes(&decoded, self.params.pt_modulus_bits())
+    }
+
+    pub fn decode_response_simplepir_raw(
+        &self,
+        client_seed: Seed,
+        response_data: &[u8],
+    ) -> Vec<u64> {
         let mut client = Client::init(&self.params);
         client.generate_secret_keys_from_seed(client_seed);
         let y_client = YClient::from_seed(&mut client, &self.params, client_seed);
-        let decoded =
-            YPIRClient::decode_response_simplepir_yclient(&self.params, &y_client, response_data);
-        let decoded_bytes = u64s_to_contiguous_bytes(&decoded, self.params.pt_modulus_bits());
-        decoded_bytes
+        YPIRClient::decode_response_simplepir_yclient(&self.params, &y_client, response_data)
     }
 
-    pub fn decode_response_normal_yclient(
+    fn decode_response_normal_yclient(
         params: &Params,
         y_client: &YClient,
         response_data: &[u8],
@@ -752,7 +758,7 @@ impl YPIRClient {
         final_result
     }
 
-    pub fn decode_response_simplepir_yclient(
+    fn decode_response_simplepir_yclient(
         params: &Params,
         y_client: &YClient,
         response_data: &[u8],
@@ -797,6 +803,8 @@ impl YPIRClient {
 
 #[cfg(test)]
 mod test {
+    use spiral_rs::arith::barrett_reduction_u128;
+
     use super::*;
 
     #[test]
@@ -809,5 +817,41 @@ mod test {
         let pt_dec = client.decrypt(&ct);
         let result = rescale(pt_dec as u64, lwe_params.modulus, lwe_params.pt_modulus) as u32;
         assert_eq!(result, pt);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_linear_accumulation_noise() {
+        let params = params_for_scenario(1 << 43, 1);
+        let upper_n = 1 << (11 + 6);
+
+        let mut client = Client::init(&params);
+        client.generate_secret_keys();
+        let y_client = YClient::new(&mut client, &params);
+        let target_idx = 0;
+        let query = y_client.generate_query(SEED_0, params.db_dim_1, false, target_idx);
+
+        let db = (0..upper_n)
+            .map(|_| fastrand::u64(0..params.pt_modulus))
+            .collect::<Vec<_>>();
+
+        let mut acc = vec![0u128; params.poly_len + 1];
+        for idx in 0..upper_n {
+            for dim in 0..params.poly_len + 1 {
+                let query_val = query[dim * upper_n + idx];
+                let db_val = db[idx];
+                let product = query_val as u128 * db_val as u128;
+                acc[dim] += product;
+            }
+        }
+
+        let mut ct = PolyMatrixRaw::zero(&params, 2, 1);
+        for dim in 0..params.poly_len + 1 {
+            ct.data[dim] = barrett_reduction_u128(&params, acc[dim]);
+        }
+
+        let _plaintext =
+            decrypt_ct_reg_measured(y_client.client(), &params, &ct.ntt(), params.poly_len);
+        todo!("problem w test: negacyclic");
     }
 }
