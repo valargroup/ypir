@@ -459,7 +459,7 @@ pub struct FilePtIter<R: Read + Seek> {
 
 impl<R: Read + Seek> FilePtIter<R> {
     pub fn new(file: R, bytes_per_row: usize, db_cols: usize, pt_bits: usize) -> Self {
-        let max_filled_col = bytes_per_row / pt_bits;
+        let max_filled_col = (bytes_per_row * 8 + pt_bits - 1) / pt_bits;
         assert!(max_filled_col <= db_cols);
 
         Self {
@@ -495,7 +495,7 @@ impl<R: Read + Seek> Iterator for FilePtIter<R> {
         // reads file, pt_bits at a time
 
         // max_filled_col pt-bits sized words contain data in each row (rest are zeros)
-        let max_filled_col = self.bytes_per_row * 8 / self.pt_bits;
+        let max_filled_col = (self.bytes_per_row * 8 + self.pt_bits - 1) / self.pt_bits;
         assert!(max_filled_col <= self.db_cols);
         if self.col_idx >= self.db_cols {
             self.col_idx = 0;
@@ -514,15 +514,16 @@ impl<R: Read + Seek> Iterator for FilePtIter<R> {
             return Some(0);
         }
 
-        // if at end of buffer, read pt_bits * 8 BITS (pt_bits bytes) of data
         if self.buf_pos == 8 {
             self.buf_pos = 0;
             self.buf.fill(0);
 
-            let read = self.file.read_exact(&mut self.buf[..self.pt_bits]);
+            let bytes_consumed = (self.col_idx / 8) * self.pt_bits;
+            let remaining_in_row = self.bytes_per_row - bytes_consumed;
+            let to_read = remaining_in_row.min(self.pt_bits);
+
+            let read = self.file.read_exact(&mut self.buf[..to_read]);
             if read.is_err() {
-                // TODO: behavior at end-of-file
-                // For now, just produce zeros infinitely now
                 self.buf_pos = 8;
                 return Some(0);
             }
@@ -612,6 +613,47 @@ mod test {
             assert_eq!(
                 i as u32,
                 u32::from_be_bytes(ci_bytes[1..5].try_into().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn test_pt_iter_unaligned_rows() {
+        use crate::bits::u64s_to_contiguous_bytes;
+
+        let pt_bits = 14;
+        let bytes_per_row = 20;
+        let max_filled_col = (bytes_per_row * 8 + pt_bits - 1) / pt_bits;
+        let db_cols = max_filled_col + 5;
+        let num_rows = 4;
+
+        let mut data = vec![0u8; num_rows * bytes_per_row];
+        for row in 0..num_rows {
+            for b in 0..bytes_per_row {
+                data[row * bytes_per_row + b] = ((row + 1) * 50 + b) as u8;
+            }
+        }
+
+        let cursor = Cursor::new(data.clone());
+        let mut iter = FilePtIter::new(cursor, bytes_per_row, db_cols, pt_bits);
+
+        for row in 0..num_rows {
+            let expected_bytes = &data[row * bytes_per_row..(row + 1) * bytes_per_row];
+            let mut pt_vals = Vec::new();
+            for _ in 0..db_cols {
+                pt_vals.push(iter.next().unwrap());
+            }
+
+            for col in max_filled_col..db_cols {
+                assert_eq!(pt_vals[col], 0, "row {row} col {col}: expected zero padding");
+            }
+
+            let as_u64s: Vec<u64> = pt_vals[..max_filled_col].iter().map(|&v| v as u64).collect();
+            let reconstructed = u64s_to_contiguous_bytes(&as_u64s, pt_bits);
+            assert_eq!(
+                &reconstructed[..bytes_per_row],
+                expected_bytes,
+                "row {row}: round-trip mismatch — cross-row contamination?"
             );
         }
     }
