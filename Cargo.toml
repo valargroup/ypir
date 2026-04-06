@@ -1,21 +1,23 @@
 [package]
-name = "ypir"
+name = "valar-ypir"
 version = "0.1.0"
 edition = "2021"
+description = "Fork of YPIR: High-Throughput Single-Server PIR with Silent Preprocessing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/valargroup/ypir"
 
 [build-dependencies]
 cc = "1.0"
 
 [features]
-default = ["server", "http_server", "http_client"]
+default = ["server"]
 server = []
 explicit_avx512 = []
 http_server = ["actix-web", "actix-http", "actix-cors", "futures", "bzip2", "base64"]
 http_client = ["reqwest"]
 
 [dependencies]
-spiral-rs = { git = "https://github.com/valargroup/spiral-rs.git", branch = "valar/avoid-avx512" }
-# spiral-rs = { path = "../spiral-rs/", default-features = false }
+spiral-rs = { package = "valar-spiral-rs", version = "0.5.0" }
 rand = { version = "0.8.5", features = ["small_rng"] }
 rand_chacha = "0.3.1"
 serde_json = "1.0"

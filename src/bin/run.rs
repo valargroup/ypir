@@ -1,5 +1,5 @@
 #[cfg(feature = "server")]
-use ypir::scheme::run_ypir_batched;
+use valar_ypir::scheme::run_ypir_batched;
 
 use clap::Parser;
 

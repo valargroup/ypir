@@ -1,8 +1,11 @@
 # YPIR
 
-This is an implementation of the YPIR scheme for single-server private information retrieval,
+This is a fork of the [YPIR](https://github.com/menonsamir/ypir) implementation of the YPIR scheme for single-server private information retrieval,
 introduced in ["YPIR: High-Throughput Single-Server PIR with Silent Preprocessing"](https://eprint.iacr.org/2024/270).
-This is joint work with [David Wu](https://www.cs.utexas.edu/~dwu4/).
+
+This fork has been **audited by [Zellic](https://zellic.io)**. The audit report is available in [`audits/zellic-audit-report.pdf`](audits/zellic-audit-report.pdf).
+
+**Client-side code is considered frozen** in this repository. Server-side code remains open to changes. This is because these changes can only affect performance, they cannot break client privacy. A server-side change could break integrity, as could a malicious server. However, all authentication of data retrieved is not done at the cryptographic layer in YPIR, but instead is an application-layer concern. In our usages within voting and spendability, authentication is explicitly addressed (via merkle path authentication checks against a trusted merkle root, or recursive proofs post-Tachyon).
 
 ## Running
 
@@ -10,11 +13,11 @@ To build and run this code:
 1. Ensure you are running on Ubuntu (at least 22.04), and that AVX-512 is available on the CPU (you can run `lscpu` and look for the `avx512f` flag).
 Our benchmarks were collected using the AWS `r6i.16xlarge` instance type, which has all necessary CPU features.
 2. Run `sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config`.
-2. [Install Rust using rustup](https://www.rust-lang.org/tools/install) using `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
+3. [Install Rust using rustup](https://www.rust-lang.org/tools/install) using `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
   - Select `1) Proceed with installation (default)` when prompted
   - After installation, configure the current shell as instructed by running `source "$HOME/.cargo/env"`
-3. Run `git clone https://github.com/menonsamir/ypir.git` and `cd ypir`.
-4. Run `cargo run --release -- 1073741824` to run YPIR on a random database consisting of 1073741824 bits (~134 MB).
+4. Run `git clone https://github.com/valargroup/ypir.git` and `cd ypir`.
+5. Run `cargo run --release -- 1073741824` to run YPIR on a random database consisting of 1073741824 bits (~134 MB).
 The first time you run this command, Cargo will download and install the necessary libraries to build the code (~2 minutes);
 later calls will not take as long. Stability warnings can be safely ignored. 
 See below for details on how to interpret the measurements.
@@ -134,7 +137,7 @@ You can run YPIR as a standalone HTTP server using a command like:
 
 
 ```sh
-$ RUST_LOG=debug cargo run --profile release-with-debug --bin server 32768 262144 --is-simplepir --inp-file ../passwords-data/hibp-passwords.bin -p 8989 --hint-file ../passwords-data/hibp-passwords-2-hint.bin
+$ RUST_LOG=debug cargo run --profile release-with-debug --features http_server --bin server 32768 262144 --is-simplepir --inp-file ../passwords-data/hibp-passwords.bin -p 8989 --hint-file ../passwords-data/hibp-passwords-2-hint.bin
 ```
 
 
@@ -142,11 +145,11 @@ $ RUST_LOG=debug cargo run --profile release-with-debug --bin server 32768 26214
 
 YPIR is based on [DoublePIR](https://eprint.iacr.org/2022/949), and this implementation
 uses matrix-vector multiplication routines based on the ones in [ahenzinger/simplepir](https://github.com/ahenzinger/simplepir).
-We also use the [menonsamir/spiral-rs](https://github.com/menonsamir/spiral-rs) library for Spiral to handle RLWE ciphertexts.
+We also use a [fork of spiral-rs](https://github.com/valargroup/spiral-rs) for Spiral to handle RLWE ciphertexts.
 
 ## Citing
 
-Please cite this work as:
+Please cite the original work as:
 
 ```
 @inproceedings{MW24,
@@ -156,3 +159,5 @@ Please cite this work as:
   year      = {2024}
 }
 ```
+
+This fork is maintained by [valargroup](https://github.com/valargroup).

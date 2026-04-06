@@ -5,11 +5,11 @@ use actix_web::HttpServer;
 use actix_web::{get, post, web, App};
 use clap::Parser;
 use spiral_rs::params::*;
-use ypir::bits::u64s_to_contiguous_bytes;
-use ypir::params::*;
-use ypir::scheme::*;
-use ypir::serialize::*;
-use ypir::server::*;
+use valar_ypir::bits::u64s_to_contiguous_bytes;
+use valar_ypir::params::*;
+use valar_ypir::scheme::*;
+use valar_ypir::serialize::*;
+use valar_ypir::server::*;
 
 /// Run the YPIR server with the given parameters
 #[derive(Parser, Debug)]

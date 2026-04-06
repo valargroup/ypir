@@ -3,9 +3,9 @@ use reqwest::blocking::Client;
 use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::time::Instant;
-use ypir::client::YPIRClient;
-use ypir::params::*;
-use ypir::serialize::ToBytes;
+use valar_ypir::client::YPIRClient;
+use valar_ypir::params::*;
+use valar_ypir::serialize::ToBytes;
 
 /// Run the YPIR server with the given parameters
 #[derive(Parser, Debug)]
