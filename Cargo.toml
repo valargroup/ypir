@@ -37,6 +37,21 @@ base64 = { optional = true, version = "0.22.1" }
 reqwest = { optional = true, version = "0.12", features = ["blocking"] }
 sha1 = { version = "0.10.6" }
 
+# The client and server binaries pull in optional deps (reqwest, actix-web,
+# etc.) that are only enabled by the `http_client` / `http_server` features.
+# Declaring `required-features` here keeps `cargo build` / `cargo publish`
+# with default features from trying to compile these bins without their
+# optional deps, which would fail.
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+required-features = ["http_server"]
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+required-features = ["http_client"]
+
 
 # [profile.release]
 # lto = "fat"
