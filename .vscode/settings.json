@@ -1,4 +1,6 @@
 {
+  "rust-analyzer.linkedProjects": ["Cargo.toml"],
+  "rust-analyzer.cargo.features": ["rayon"],
   "rust-analyzer.runnables.extraArgs": [
     "--profile",
     "release-with-debug"
