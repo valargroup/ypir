@@ -1,4 +1,4 @@
-#![cfg_attr(feature = "explicit_avx512", feature(stdarch_x86_avx512))]
+// AVX-512 intrinsics are stable since Rust 1.72; no feature gate needed.
 
 pub mod bits;
 pub mod client;
