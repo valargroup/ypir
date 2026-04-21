@@ -1,6 +1,6 @@
 [package]
 name = "valar-ypir"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Fork of YPIR: High-Throughput Single-Server PIR with Silent Preprocessing"
 license = "MIT OR Apache-2.0"
