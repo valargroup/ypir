@@ -32,25 +32,72 @@ use std::arch::x86_64::*;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
-/// Dispatches to the AVX-512 implementation when the `explicit_avx512`
-/// feature is enabled.
-#[cfg(feature = "explicit_avx512")]
-pub fn fast_batched_dot_product<const K: usize, T: Copy>(
-    params: &Params,
-    c: &mut [u64],
-    a: &[u64],
-    a_elems: usize,
-    b_t: &[T], // transposed
-    b_rows: usize,
-    b_cols: usize,
-) where
-    *const T: ToM512 + ToU64,
-{
-    fast_batched_dot_product_explicit_avx512::<K, T>(params, c, a, a_elems, b_t, b_rows, b_cols)
+// ── Shared helpers ─────────────────────────────────────────────────────────
+//
+// Every kernel variant (AVX-512 / scalar × rayon / sequential) goes through
+// these two steps:
+//
+//   1. Split the flat `a` buffer of length K*a_elems into K per-batch query
+//      vectors of length a_elems.
+//   2. For each output cell, finalize `(sum_lo, sum_hi)` into `c[j]` by
+//      applying Barrett reduction to each CRT component, CRT-recomposing,
+//      and accumulating into the (possibly pre-existing) value in `c[j]`.
+//
+// Extracted so the four code paths don't each carry their own copy and risk
+// drifting (e.g. a bugfix applied to three of four call sites).
+
+/// Split `a` (laid out as K batch-rows concatenated) into K equal-length
+/// slices.  Caller must ensure `a.len() % K == 0`; assertion is implicit in
+/// `chunks_exact`.
+#[inline(always)]
+fn split_a<const K: usize>(a: &[u64]) -> [&[u64]; K] {
+    let mut out: [&[u64]; K] = [&[]; K];
+    for (slot, chunk) in out.iter_mut().zip(a.chunks_exact(a.len() / K)) {
+        *slot = chunk;
+    }
+    out
 }
 
-/// Dispatches to the scalar fallback when AVX-512 is not enabled.
-#[cfg(not(feature = "explicit_avx512"))]
+/// Finalize a single output cell from its two CRT half-sums.
+///
+/// Applies Barrett reduction to each half (mod q0, mod q1), recomposes via
+/// CRT into a single element mod q, and accumulates into `*c_cell` with a
+/// final Barrett reduction so the stored value stays in `[0, q)`.
+///
+/// This is the common tail of both the scalar and AVX-512 kernels.
+#[inline(always)]
+fn writeback(params: &Params, c_cell: &mut u64, sum_lo: u64, sum_hi: u64) {
+    let lo = barrett_coeff_u64(params, sum_lo, 0);
+    let hi = barrett_coeff_u64(params, sum_hi, 1);
+    let res = params.crt_compose_2(lo, hi);
+    *c_cell = barrett_u64(params, *c_cell + res);
+}
+
+/// AVX-512 tail: horizontally reduce the two 512-bit accumulators to two
+/// `u64`s, then delegate to `writeback`.
+///
+/// # Safety
+/// Caller must be running on a CPU with AVX-512F.  The `__m512i` arguments
+/// are produced by `_mm512_setzero_si512` and subsequent
+/// `_mm512_add_epi64` / `_mm512_mul_epu32` calls; this helper only reads
+/// them via `_mm512_store_si512`.
+#[cfg(feature = "explicit_avx512")]
+#[inline(always)]
+unsafe fn writeback_avx512(
+    params: &Params,
+    c_cell: &mut u64,
+    sum_lo: __m512i,
+    sum_hi: __m512i,
+) {
+    let mut vl = [0u64; 8];
+    let mut vh = [0u64; 8];
+    _mm512_store_si512(vl.as_mut_ptr() as *mut _, sum_lo);
+    _mm512_store_si512(vh.as_mut_ptr() as *mut _, sum_hi);
+    writeback(params, c_cell, vl.iter().sum(), vh.iter().sum());
+}
+
+/// Dispatches to the AVX-512 implementation when `explicit_avx512` is
+/// enabled, falling back to the scalar implementation otherwise.
 pub fn fast_batched_dot_product<const K: usize, T: Copy>(
     params: &Params,
     c: &mut [u64],
@@ -62,7 +109,10 @@ pub fn fast_batched_dot_product<const K: usize, T: Copy>(
 ) where
     *const T: ToM512 + ToU64,
 {
-    fast_batched_dot_product_implicit::<K, T>(params, c, a, a_elems, b_t, b_rows, b_cols)
+    #[cfg(feature = "explicit_avx512")]
+    fast_batched_dot_product_explicit_avx512::<K, T>(params, c, a, a_elems, b_t, b_rows, b_cols);
+    #[cfg(not(feature = "explicit_avx512"))]
+    fast_batched_dot_product_implicit::<K, T>(params, c, a, a_elems, b_t, b_rows, b_cols);
 }
 
 #[cfg(not(feature = "explicit_avx512"))]
@@ -105,8 +155,6 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
 {
     assert_eq!(a_elems, b_rows);
 
-    // debug!("Multiplying {}x{} by {}x{}", K, a_elems, b_rows, b_cols);
-
     let simd_width = 8; // 512 bits / 64 bits per lane
 
     // Tile the accumulation dimension into chunks to balance register
@@ -114,18 +162,6 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
     // L1; `.min(a_elems / simd_width)` handles small inputs.
     let chunk_size = (8192 / K.next_power_of_two()).min(a_elems / simd_width);
     let num_chunks = (a_elems / simd_width) / chunk_size;
-    // debug!("k_chunk_size: {}, k_num_chunks: {}", chunk_size, num_chunks);
-
-    let j_chunk_size = 1;
-    let j_num_chunks = b_cols / j_chunk_size;
-    // debug!(
-    //     "j_chunk_size: {}, j_num_chunks: {}",
-    //     j_chunk_size, j_num_chunks
-    // );
-
-    // let mut result = AlignedMemory64::new(b_cols);
-    // let res_mut_slc = result.as_mut_slice();
-    let res_mut_slc = c;
 
     // ── Rayon parallel path (AVX-512) ──────────────────────────────────
     //
@@ -197,26 +233,20 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
         let num_threads = rayon::current_num_threads();
         let cols_per_chunk = (b_cols + num_threads - 1) / num_threads;
 
-        res_mut_slc
-            .par_chunks_mut(cols_per_chunk)
+        c.par_chunks_mut(cols_per_chunk)
             .enumerate()
             .for_each(|(chunk_idx, c_chunk)| {
                 let j_start = chunk_idx * cols_per_chunk;
                 unsafe {
                     let b_ptr = b_addr as *const T;
                     let a_slice = std::slice::from_raw_parts(a_addr as *const u64, a_len);
-                    let mut a_slcs: [&[u64]; K] = [&[]; K];
-                    for (slc_mut, chunk) in
-                        a_slcs.iter_mut().zip(a_slice.chunks_exact(a_len / K))
-                    {
-                        *slc_mut = chunk;
-                    }
+                    let a_slcs = split_a::<K>(a_slice);
 
                     // Outer loop over row chunks (accumulation dimension).
                     // Each k_outer processes `chunk_size` groups of 8 (simd_width)
                     // elements, accumulating partial sums in AVX-512 registers.
                     for k_outer in 0..num_chunks {
-                        for j_local in 0..c_chunk.len() {
+                        for (j_local, c_cell) in c_chunk.iter_mut().enumerate() {
                             let j = j_start + j_local;
                             if j >= b_cols {
                                 break;
@@ -253,27 +283,9 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
                                 }
                             }
 
-                            // Horizontal reduction: sum the 8 lanes of each
-                            // 512-bit accumulator, then apply Barrett reduction
-                            // and CRT recomposition (same as the single-threaded path).
-                            let mut values_lo = [0u64; 8];
-                            let mut values_hi = [0u64; 8];
-                            _mm512_store_si512(
-                                (&mut values_lo).as_mut_ptr() as *mut _,
-                                total_sum_lo[0],
-                            );
-                            _mm512_store_si512(
-                                (&mut values_hi).as_mut_ptr() as *mut _,
-                                total_sum_hi[0],
-                            );
-                            let res_lo: u64 = values_lo.iter().sum();
-                            let res_hi: u64 = values_hi.iter().sum();
-                            let (lo, hi) = (
-                                barrett_coeff_u64(params, res_lo, 0),
-                                barrett_coeff_u64(params, res_hi, 1),
-                            );
-                            let res = params.crt_compose_2(lo, hi);
-                            c_chunk[j_local] = barrett_u64(params, c_chunk[j_local] + res);
+                            // K=1-only path: reduce and write back batch 0.
+                            // See the K=1 discussion comment above.
+                            writeback_avx512(params, c_cell, total_sum_lo[0], total_sum_hi[0]);
                         }
                     }
                 }
@@ -282,93 +294,40 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
     }
 
     unsafe {
-        let mut a_slcs: [&[u64]; K] = [&[]; K];
-        for (slc_mut, chunk) in a_slcs.iter_mut().zip(a.chunks_exact(a.len() / K)) {
-            *slc_mut = chunk;
-        }
-
-        // let a_ptr = a.as_ptr();
+        let a_slcs = split_a::<K>(a);
         let b_ptr = b_t.as_ptr();
 
         for k_outer in 0..num_chunks {
-            for j_outer in 0..j_num_chunks {
-                for j_inner in 0..j_chunk_size {
-                    let j = j_outer * j_chunk_size + j_inner;
+            for j in 0..b_cols {
+                let mut total_sum_lo = [_mm512_setzero_si512(); K];
+                let mut total_sum_hi = [_mm512_setzero_si512(); K];
+                let mut tmp = [_mm512_setzero_si512(); K];
 
-                    let mut total_sum_lo = [_mm512_setzero_si512(); K];
-                    let mut total_sum_hi = [_mm512_setzero_si512(); K];
-                    let mut tmp = [_mm512_setzero_si512(); K];
+                for k_inner in 0..chunk_size {
+                    let k = simd_width * (k_outer * chunk_size + k_inner);
+                    let b_val_simd = b_ptr.add(j * b_rows + k).to_m512();
 
-                    for k_inner in 0..chunk_size {
-                        let k = simd_width * (k_outer * chunk_size + k_inner);
-
-                        let a_idx = k;
-                        let b_idx = j * b_rows + k;
-                        let b_val_simd = b_ptr.add(b_idx).to_m512();
-
-                        for batch in 0..K {
-                            tmp[batch] =
-                                _mm512_load_si512(a_slcs[batch].as_ptr().add(a_idx) as *const _);
-                        }
-
-                        for batch in 0..K {
-                            let a_val_lo = tmp[batch];
-                            let a_val_hi = _mm512_srli_epi64(tmp[batch], 32);
-
-                            total_sum_lo[batch] = _mm512_add_epi64(
-                                total_sum_lo[batch],
-                                _mm512_mul_epu32(a_val_lo, b_val_simd),
-                            );
-                            total_sum_hi[batch] = _mm512_add_epi64(
-                                total_sum_hi[batch],
-                                _mm512_mul_epu32(a_val_hi, b_val_simd),
-                            );
-                        }
+                    for batch in 0..K {
+                        tmp[batch] = _mm512_load_si512(a_slcs[batch].as_ptr().add(k) as *const _);
                     }
 
-                    let res_mut_slcs = res_mut_slc.chunks_exact_mut(res_mut_slc.len() / K);
-                    for (batch, res_mut_slc) in (0..K).zip(res_mut_slcs) {
-                        let mut values_lo = [0u64; 8];
-                        let mut values_hi = [0u64; 8];
-                        _mm512_store_si512(
-                            (&mut values_lo).as_mut_ptr() as *mut _,
+                    for batch in 0..K {
+                        let a_val_lo = tmp[batch];
+                        let a_val_hi = _mm512_srli_epi64(tmp[batch], 32);
+
+                        total_sum_lo[batch] = _mm512_add_epi64(
                             total_sum_lo[batch],
+                            _mm512_mul_epu32(a_val_lo, b_val_simd),
                         );
-                        _mm512_store_si512(
-                            (&mut values_hi).as_mut_ptr() as *mut _,
+                        total_sum_hi[batch] = _mm512_add_epi64(
                             total_sum_hi[batch],
+                            _mm512_mul_epu32(a_val_hi, b_val_simd),
                         );
-
-                        let res_lo = values_lo[0]
-                            + values_lo[1]
-                            + values_lo[2]
-                            + values_lo[3]
-                            + values_lo[4]
-                            + values_lo[5]
-                            + values_lo[6]
-                            + values_lo[7];
-
-                        let res_hi = values_hi[0]
-                            + values_hi[1]
-                            + values_hi[2]
-                            + values_hi[3]
-                            + values_hi[4]
-                            + values_hi[5]
-                            + values_hi[6]
-                            + values_hi[7];
-
-                        // res_mut_slc[j] = res_lo + res_hi;
-
-                        let (lo, hi) = (
-                            barrett_coeff_u64(params, res_lo as u64, 0),
-                            barrett_coeff_u64(params, res_hi as u64, 1),
-                        );
-
-                        // res_mut_slc[j] = lo | (hi << 32);
-
-                        let res = params.crt_compose_2(lo, hi);
-                        res_mut_slc[j] = barrett_u64(params, res_mut_slc[j] + res);
                     }
+                }
+
+                for (batch, c_row) in c.chunks_exact_mut(c.len() / K).enumerate() {
+                    writeback_avx512(params, &mut c_row[j], total_sum_lo[batch], total_sum_hi[batch]);
                 }
             }
         }
@@ -401,11 +360,6 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
     let chunk_size = (65536 / K.next_power_of_two()).min(a_elems / simd_width);
     let num_chunks = (a_elems / simd_width) / chunk_size;
 
-    let j_chunk_size = 1;
-    let j_num_chunks = b_cols / j_chunk_size;
-
-    let res_mut_slc = c;
-
     // ── Rayon parallel path (scalar / implicit) ────────────────────────
     //
     // Identical column-parallel strategy as the AVX-512 rayon path above,
@@ -437,23 +391,17 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
         let num_threads = rayon::current_num_threads();
         let cols_per_chunk = (b_cols + num_threads - 1) / num_threads;
 
-        res_mut_slc
-            .par_chunks_mut(cols_per_chunk)
+        c.par_chunks_mut(cols_per_chunk)
             .enumerate()
             .for_each(|(chunk_idx, c_chunk)| {
                 let j_start = chunk_idx * cols_per_chunk;
                 unsafe {
                     let b_ptr = b_addr as *const T;
                     let a_slice = std::slice::from_raw_parts(a_addr as *const u64, a_len);
-                    let mut a_slcs: [&[u64]; K] = [&[]; K];
-                    for (slc_mut, chunk) in
-                        a_slcs.iter_mut().zip(a_slice.chunks_exact(a_len / K))
-                    {
-                        *slc_mut = chunk;
-                    }
+                    let a_slcs = split_a::<K>(a_slice);
 
                     for k_outer in 0..num_chunks {
-                        for j_local in 0..c_chunk.len() {
+                        for (j_local, c_cell) in c_chunk.iter_mut().enumerate() {
                             let j = j_start + j_local;
                             if j >= b_cols {
                                 break;
@@ -479,14 +427,9 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
                                 }
                             }
 
-                            let res_lo = total_sum_lo[0];
-                            let res_hi = total_sum_hi[0];
-                            let (lo, hi) = (
-                                barrett_coeff_u64(params, res_lo, 0),
-                                barrett_coeff_u64(params, res_hi, 1),
-                            );
-                            let res = params.crt_compose_2(lo, hi);
-                            c_chunk[j_local] = barrett_u64(params, c_chunk[j_local] + res);
+                            // K=1-only path: reduce and write back batch 0.
+                            // See the K=1 discussion comment above.
+                            writeback(params, c_cell, total_sum_lo[0], total_sum_hi[0]);
                         }
                     }
                 }
@@ -496,55 +439,33 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
 
     #[cfg(not(feature = "rayon"))]
     unsafe {
-        // let a_ptr = a.as_ptr();
-        let mut a_slcs: [&[u64]; K] = [&[]; K];
-        for (slc_mut, chunk) in a_slcs.iter_mut().zip(a.chunks_exact(a.len() / K)) {
-            *slc_mut = chunk;
-        }
+        let a_slcs = split_a::<K>(a);
         let b_ptr = b_t.as_ptr();
 
         for k_outer in 0..num_chunks {
-            for j_outer in 0..j_num_chunks {
-                for j_inner in 0..j_chunk_size {
-                    let j = j_outer * j_chunk_size + j_inner;
+            for j in 0..b_cols {
+                let mut total_sum_lo = [0u64; K];
+                let mut total_sum_hi = [0u64; K];
+                let mut tmp = [0u64; K];
 
-                    let mut total_sum_lo = [0u64; K];
-                    let mut total_sum_hi = [0u64; K];
-                    let mut tmp = [0u64; K];
+                for k_inner in 0..chunk_size {
+                    let k = simd_width * (k_outer * chunk_size + k_inner);
+                    let b_val_simd = (b_ptr.add(j * b_rows + k) as *const T).to_u64();
 
-                    for k_inner in 0..chunk_size {
-                        let k = simd_width * (k_outer * chunk_size + k_inner);
-
-                        let a_idx = k;
-                        let b_idx = j * b_rows + k;
-                        let b_val_simd = (b_ptr.add(b_idx) as *const T).to_u64();
-
-                        for batch in 0..K {
-                            tmp[batch] = *(a_slcs[batch].as_ptr().add(a_idx));
-                        }
-
-                        for batch in 0..K {
-                            let a_val_lo = (tmp[batch] as u32) as u64;
-                            let a_val_hi = ((tmp[batch] >> 32) as u32) as u64;
-
-                            total_sum_lo[batch] += a_val_lo * b_val_simd;
-                            total_sum_hi[batch] += a_val_hi * b_val_simd;
-                        }
+                    for batch in 0..K {
+                        tmp[batch] = *(a_slcs[batch].as_ptr().add(k));
                     }
 
-                    let res_mut_slcs = res_mut_slc.chunks_exact_mut(res_mut_slc.len() / K);
-                    for (batch, res_mut_slc) in (0..K).zip(res_mut_slcs) {
-                        let res_lo = total_sum_lo[batch];
-                        let res_hi = total_sum_hi[batch];
-
-                        let (lo, hi) = (
-                            barrett_coeff_u64(params, res_lo as u64, 0),
-                            barrett_coeff_u64(params, res_hi as u64, 1),
-                        );
-
-                        let res = params.crt_compose_2(lo, hi);
-                        res_mut_slc[j] = barrett_u64(params, res_mut_slc[j] + res);
+                    for batch in 0..K {
+                        let a_val_lo = (tmp[batch] as u32) as u64;
+                        let a_val_hi = ((tmp[batch] >> 32) as u32) as u64;
+                        total_sum_lo[batch] += a_val_lo * b_val_simd;
+                        total_sum_hi[batch] += a_val_hi * b_val_simd;
                     }
+                }
+
+                for (batch, c_row) in c.chunks_exact_mut(c.len() / K).enumerate() {
+                    writeback(params, &mut c_row[j], total_sum_lo[batch], total_sum_hi[batch]);
                 }
             }
         }
