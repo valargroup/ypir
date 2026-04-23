@@ -231,7 +231,11 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
         let a_addr: usize = a.as_ptr() as usize;
         let a_len = a.len();
         let num_threads = rayon::current_num_threads();
-        let cols_per_chunk = (b_cols + num_threads - 1) / num_threads;
+        // `.max(1)` so `par_chunks_mut` never gets a zero chunk size — it
+        // panics on 0.  When b_cols == 0 the slice is empty, so any
+        // positive chunk size yields zero chunks and the closure is a
+        // no-op, which is the correct result.
+        let cols_per_chunk = ((b_cols + num_threads - 1) / num_threads).max(1);
 
         c.par_chunks_mut(cols_per_chunk)
             .enumerate()
@@ -389,7 +393,9 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
         let a_addr: usize = a.as_ptr() as usize;
         let a_len = a.len();
         let num_threads = rayon::current_num_threads();
-        let cols_per_chunk = (b_cols + num_threads - 1) / num_threads;
+        // See the matching comment in the AVX-512 path above for why
+        // `.max(1)` is needed.
+        let cols_per_chunk = ((b_cols + num_threads - 1) / num_threads).max(1);
 
         c.par_chunks_mut(cols_per_chunk)
             .enumerate()
@@ -1063,6 +1069,37 @@ mod test {
         #[test]
         fn test_rayon_implicit_large() {
             assert_rayon_matches_reference(65536, 32768);
+        }
+
+        /// Edge case: `b_cols = 0`.  The rayon path must not panic and
+        /// must not write anywhere.  This exercises `par_chunks_mut` on
+        /// an empty output, which yields zero chunks — the inner closure
+        /// should simply not run.
+        #[test]
+        fn test_rayon_implicit_b_cols_zero() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 0;
+
+            let a = random_bounded_aligned(a_elems, params.modulus);
+            let b_t_u16: Vec<u16> = Vec::new();
+
+            // Zero-length output buffer — the kernel must accept this
+            // and simply return without touching anything.
+            let mut c = AlignedMemory64::new(b_cols.max(1));
+            let c_before = c.as_slice()[0];
+            fast_batched_dot_product_implicit::<1, _>(
+                &params,
+                &mut c.as_mut_slice()[..b_cols],
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+            // Sanity: the one byte past the empty slice we allocated is
+            // untouched, so the kernel did not write out of bounds.
+            assert_eq!(c.as_slice()[0], c_before);
         }
 
         #[test]
