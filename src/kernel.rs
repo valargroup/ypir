@@ -1370,6 +1370,95 @@ mod test {
 
             assert_eq!(c1.as_slice(), c2.as_slice(), "rayon results not deterministic");
         }
+
+        /// Concurrent invocations must not corrupt each other.
+        ///
+        /// A PIR server pins one kernel call per inflight request and
+        /// can be servicing many queries at once, so the rayon kernel
+        /// is re-entered from multiple OS threads concurrently.  Rayon
+        /// handles this by running nested `par_iter` work on a shared
+        /// global pool, but any subtle shared-state bug (e.g. a helper
+        /// accidentally capturing a `static mut`, or a future rayon
+        /// upgrade interacting badly with nested pools) would show up
+        /// as cross-request data corruption — a catastrophic failure
+        /// mode for PIR where the client cannot detect it.
+        ///
+        /// We spawn N std::threads, each driving the kernel with its
+        /// own independent `a` / `b_t` / `c` buffers, and assert every
+        /// thread's result matches a pre-computed reference.  No kernel
+        /// invocation sees another invocation's inputs, so any
+        /// mismatch is unambiguously a concurrency bug.
+        #[test]
+        fn test_rayon_concurrent_invocations() {
+            use std::sync::Arc;
+            use std::thread;
+
+            let params = Arc::new(test_params());
+            let a_elems = 65536;
+            let b_cols = 1024;
+            // Enough threads to exceed rayon's default pool fan-out and
+            // force contention for worker threads between invocations.
+            let num_drivers = 8;
+
+            // Pre-compute each driver's reference on the main thread so
+            // concurrent test logic can stay focused on the kernel.
+            let inputs: Vec<_> = (0..num_drivers)
+                .map(|seed| {
+                    fastrand::seed(seed as u64);
+                    let a = random_bounded_aligned(a_elems, params.modulus);
+                    let b_t_u16 = random_u16_vec(a_elems * b_cols);
+                    let mut c_ref = vec![0u64; b_cols];
+                    reference_dot_product_transposed_u16(
+                        &params,
+                        &mut c_ref,
+                        a.as_slice(),
+                        a_elems,
+                        &b_t_u16,
+                        a_elems,
+                        b_cols,
+                    );
+                    // AlignedMemory64 isn't Send, but we only need the
+                    // underlying bytes in the worker threads, so copy
+                    // into a plain Vec.  Each worker allocates a fresh
+                    // AlignedMemory64 for the kernel's alignment needs.
+                    (a.as_slice().to_vec(), b_t_u16, c_ref)
+                })
+                .collect();
+
+            let handles: Vec<_> = inputs
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (a_vec, b_t_u16, c_ref))| {
+                    let params = Arc::clone(&params);
+                    thread::spawn(move || {
+                        // Copy `a` into aligned memory inside the worker.
+                        let mut a = AlignedMemory64::new(a_vec.len());
+                        a.as_mut_slice().copy_from_slice(&a_vec);
+
+                        let mut c = AlignedMemory64::new(b_cols);
+                        fast_batched_dot_product_implicit::<1, _>(
+                            &params,
+                            c.as_mut_slice(),
+                            a.as_slice(),
+                            a_elems,
+                            &b_t_u16,
+                            a_elems,
+                            b_cols,
+                        );
+                        for j in 0..b_cols {
+                            assert_eq!(
+                                c.as_slice()[j], c_ref[j],
+                                "driver {idx}: concurrent mismatch at col {j}"
+                            );
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().expect("concurrent kernel driver panicked");
+            }
+        }
     }
 
     // ── AVX-512 tests: hand-written intrinsics must match reference ──
