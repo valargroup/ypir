@@ -118,15 +118,16 @@ fn writeback(params: &Params, c_cell: &mut u64, sum_lo: u64, sum_hi: u64) {
 /// - Caller must be running on a CPU with AVX-512F.  The `__m512i`
 ///   arguments are produced by `_mm512_setzero_si512` and subsequent
 ///   `_mm512_add_epi64` / `_mm512_mul_epu32` calls; this helper only
-///   reads them via `_mm512_store_si512`.
-/// - `_mm512_store_si512` is formally specified to require 64-byte
-///   alignment of the destination; the stack-allocated `[u64; 8]` here
-///   is only 8-byte aligned by Rust's type-alignment rules.  This has
-///   worked in practice (either because the stack happens to be more
-///   aligned, or because LLVM lowers to an unaligned store) and mirrors
-///   the pre-existing code — but it is a known latent issue worth
-///   fixing separately (e.g. by using `AlignedMemory64` or
-///   `_mm512_storeu_si512`).
+///   reads them back via an unaligned store.
+///
+/// We use `_mm512_storeu_si512` rather than `_mm512_store_si512` because
+/// a stack-allocated `[u64; 8]` is only 8-byte aligned by Rust's
+/// type-alignment rules, and the aligned store formally requires the
+/// destination to be 64-byte aligned (Intel SDM: #GP on misalignment).
+/// LLVM currently lowers the aligned intrinsic to `vmovdqu64` in most
+/// cases so it has "worked in practice", but that's a codegen accident;
+/// the unaligned variant is spec-correct on any alignment and the two
+/// generate identical code on Skylake-X and later (same `vmovdqu64`).
 #[cfg(feature = "explicit_avx512")]
 #[inline(always)]
 unsafe fn writeback_avx512(
@@ -137,8 +138,8 @@ unsafe fn writeback_avx512(
 ) {
     let mut vl = [0u64; 8];
     let mut vh = [0u64; 8];
-    _mm512_store_si512(vl.as_mut_ptr() as *mut _, sum_lo);
-    _mm512_store_si512(vh.as_mut_ptr() as *mut _, sum_hi);
+    _mm512_storeu_si512(vl.as_mut_ptr() as *mut _, sum_lo);
+    _mm512_storeu_si512(vh.as_mut_ptr() as *mut _, sum_hi);
     writeback(params, c_cell, vl.iter().sum(), vh.iter().sum());
 }
 
