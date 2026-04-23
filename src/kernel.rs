@@ -49,23 +49,25 @@ use rayon::prelude::*;
 /// Split `a` (laid out as K batch-rows concatenated) into K equal-length
 /// sub-slices, each of length `a.len() / K`.
 ///
-/// # Preconditions
+/// # Panics
 ///
-/// - `a.len() % K == 0`.  The kernel callers always hold this invariant
-///   because they allocate `a` as `K * a_elems` and pass the whole slice.
-/// - `K > 0`.  `K == 0` would be a division by zero; debug-checked below.
+/// Panics if `K == 0` (a const-generic misuse that should be caught at
+/// the call site anyway) or if `a.len()` is not a multiple of K.
 ///
-/// Violating the length precondition silently drops the trailing
-/// `a.len() % K` elements (because `chunks_exact` discards the remainder)
-/// and the last batch row would not see them, producing silently wrong
-/// results.  We debug-assert to catch this in development builds; we
-/// deliberately do not check in release builds because this is called
-/// in the inner dispatch path of a hot kernel and the callers are fully
-/// controlled within this module.
+/// The length check is a **runtime** `assert!`, not a `debug_assert!`,
+/// because violating it would silently drop the trailing `a.len() % K`
+/// elements: `chunks_exact` discards the remainder rather than panicking.
+/// For a PIR kernel where the output goes back to a client as a
+/// ciphertext, a silently-truncated dot product produces a response
+/// that decrypts to the wrong value — a correctness failure that no
+/// downstream code can recover from and that release builds must not
+/// be able to hit.  The check is one cmp+jne per kernel invocation
+/// (not per inner-loop iteration) so it does not affect hot-path
+/// performance.
 #[inline(always)]
 fn split_a<const K: usize>(a: &[u64]) -> [&[u64]; K] {
-    debug_assert!(K > 0, "split_a requires K > 0");
-    debug_assert_eq!(
+    assert!(K > 0, "split_a requires K > 0");
+    assert_eq!(
         a.len() % K,
         0,
         "split_a: a.len() ({}) must be a multiple of K ({})",
