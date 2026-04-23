@@ -1316,4 +1316,423 @@ mod test {
             assert_eq!(c1.as_slice(), c2.as_slice(), "rayon results not deterministic");
         }
     }
+
+    // ── AVX-512 tests: hand-written intrinsics must match reference ──
+    //
+    // These tests require the `explicit_avx512` Cargo feature and an
+    // AVX-512F-capable CPU at runtime.  They cover the hand-written
+    // `fast_batched_dot_product_explicit_avx512` kernel, which on CPUs
+    // with AVX-512 is the production hot path.
+    //
+    // Two code paths exist inside that function and both are covered:
+    //   - K == 1, `rayon` feature enabled: the parallel `par_chunks_mut`
+    //     path that splits `b_cols` across threads.
+    //   - K >= 1 without rayon *or* K > 1 with rayon: the sequential
+    //     column loop.  The K=2 test forces this path even when `rayon`
+    //     is enabled, because the K=1 rayon gate only fires for K=1.
+    //
+    // Oracles:
+    //   - `reference_dot_product_transposed_u16` is the u128-precise
+    //     scalar reference — the authoritative oracle for numerical
+    //     correctness.
+    //   - `fast_batched_dot_product_implicit` is the scalar kernel used
+    //     on non-AVX-512 targets.  AVX-512 must bit-exactly agree with
+    //     it, which is a stronger invariant than matching the reference
+    //     (both must agree *and* agree with the reference).
+    //
+    // Running locally:
+    //   cargo test --release --features explicit_avx512,rayon \
+    //       kernel::test::avx512_tests
+    //
+    // These tests panic with "illegal instruction" rather than failing
+    // gracefully if run on a CPU without AVX-512F.  The assumption is
+    // that anyone enabling `explicit_avx512` knows their target.
+    #[cfg(feature = "explicit_avx512")]
+    mod avx512_tests {
+        use super::*;
+        use test_log::test;
+
+        /// Runs the AVX-512 kernel and asserts bit-exact agreement with
+        /// the u128 reference.  This is the primary correctness oracle.
+        fn assert_avx512_matches_reference(a_elems: usize, b_cols: usize) {
+            let params = test_params();
+
+            let a = random_bounded_aligned(a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_ref = vec![0u64; b_cols];
+            reference_dot_product_transposed_u16(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_avx = AlignedMemory64::new(b_cols);
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            for j in 0..b_cols {
+                assert_eq!(
+                    c_avx.as_slice()[j], c_ref[j],
+                    "AVX-512 vs reference mismatch at col {j} \
+                     (a_elems={a_elems}, b_cols={b_cols})"
+                );
+            }
+        }
+
+        /// Runs both AVX-512 and scalar kernels on identical inputs and
+        /// asserts bit-exact agreement.  Guards against regressions where
+        /// one path gets updated but the other does not.
+        fn assert_avx512_matches_implicit(a_elems: usize, b_cols: usize) {
+            let params = test_params();
+
+            let a = random_bounded_aligned(a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_avx = AlignedMemory64::new(b_cols);
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_scalar = AlignedMemory64::new(b_cols);
+            fast_batched_dot_product_implicit::<1, _>(
+                &params,
+                c_scalar.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(
+                c_avx.as_slice(),
+                c_scalar.as_slice(),
+                "AVX-512 and scalar kernels disagree (a_elems={a_elems}, b_cols={b_cols})"
+            );
+        }
+
+        #[test]
+        fn test_avx512_standard() {
+            assert_avx512_matches_reference(65536, 1024);
+        }
+
+        /// Exercises the inner loop with a single output column.  On the
+        /// rayon path this also means only one chunk is produced.
+        #[test]
+        fn test_avx512_single_column() {
+            assert_avx512_matches_reference(65536, 1);
+        }
+
+        /// Small `b_cols` — every thread on the rayon path gets at most
+        /// one column, and the sequential path iterates twice.
+        #[test]
+        fn test_avx512_two_columns() {
+            assert_avx512_matches_reference(65536, 2);
+        }
+
+        /// Non-power-of-two `b_cols` catches off-by-one errors in chunk
+        /// sizing and tail handling.
+        #[test]
+        fn test_avx512_non_power_of_two_cols() {
+            assert_avx512_matches_reference(65536, 100);
+        }
+
+        #[test]
+        fn test_avx512_large() {
+            assert_avx512_matches_reference(65536, 32768);
+        }
+
+        /// Edge case: `b_cols = 0` must not panic or write anywhere.
+        #[test]
+        fn test_avx512_b_cols_zero() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 0;
+
+            let a = random_bounded_aligned(a_elems, params.modulus);
+            let b_t_u16: Vec<u16> = Vec::new();
+
+            let mut c = AlignedMemory64::new(b_cols.max(1));
+            let c_before = c.as_slice()[0];
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                &mut c.as_mut_slice()[..b_cols],
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+            assert_eq!(c.as_slice()[0], c_before);
+        }
+
+        /// Verifies that the kernel accumulates (`c += A · B^T`) rather
+        /// than overwriting.  The CRT-reduced double result must equal
+        /// what you get from running the kernel twice into the same
+        /// buffer.
+        #[test]
+        fn test_avx512_accumulates() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 256;
+
+            let a = random_bounded_aligned(a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_once = AlignedMemory64::new(b_cols);
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c_once.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_twice = AlignedMemory64::new(b_cols);
+            for _ in 0..2 {
+                fast_batched_dot_product_explicit_avx512::<1, _>(
+                    &params,
+                    c_twice.as_mut_slice(),
+                    a.as_slice(),
+                    a_elems,
+                    &b_t_u16,
+                    a_elems,
+                    b_cols,
+                );
+            }
+
+            for j in 0..b_cols {
+                let expected = barrett_u64(
+                    &params,
+                    c_once.as_slice()[j] + c_once.as_slice()[j],
+                );
+                assert_eq!(
+                    c_twice.as_slice()[j], expected,
+                    "AVX-512 accumulation mismatch at column {j}"
+                );
+            }
+        }
+
+        /// All-zero `a` — every column must be exactly 0.  Trivially
+        /// catches any spurious non-zero writes from the reduction /
+        /// writeback path.
+        #[test]
+        fn test_avx512_zero_a() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 64;
+
+            let a = AlignedMemory64::new(a_elems);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c = AlignedMemory64::new(b_cols);
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            for j in 0..b_cols {
+                assert_eq!(c.as_slice()[j], 0, "expected zero at column {j}");
+            }
+        }
+
+        /// Maximum-magnitude inputs.  Exercises the overflow boundaries
+        /// of the 32x32 → 64-bit multiplies and the subsequent Barrett
+        /// reductions.  Any mis-ordered addition or missed reduction
+        /// will show up as a mismatch with the u128 reference.
+        #[test]
+        fn test_avx512_modulus_boundary() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 32;
+
+            let mut a = AlignedMemory64::new(a_elems);
+            for i in 0..a_elems {
+                a[i] = params.modulus - 1;
+            }
+            let b_t_u16: Vec<u16> = vec![u16::MAX; a_elems * b_cols];
+
+            let mut c_ref = vec![0u64; b_cols];
+            reference_dot_product_transposed_u16(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_avx = AlignedMemory64::new(b_cols);
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            for j in 0..b_cols {
+                assert_eq!(
+                    c_avx.as_slice()[j], c_ref[j],
+                    "AVX-512 modulus-boundary mismatch at column {j}"
+                );
+            }
+        }
+
+        /// Determinism: repeated invocations on identical inputs must
+        /// produce bit-identical outputs.  The rayon path's thread
+        /// schedule is non-deterministic, but since each thread writes
+        /// to a disjoint output slice and accumulation within a column
+        /// is ordered, the result must be stable across runs.
+        #[test]
+        fn test_avx512_deterministic() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 512;
+
+            let a = random_bounded_aligned(a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c1 = AlignedMemory64::new(b_cols);
+            let mut c2 = AlignedMemory64::new(b_cols);
+
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c1.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+            fast_batched_dot_product_explicit_avx512::<1, _>(
+                &params,
+                c2.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(
+                c1.as_slice(),
+                c2.as_slice(),
+                "AVX-512 results not deterministic"
+            );
+        }
+
+        /// Bit-exact cross-check against the scalar kernel.  Stronger
+        /// than matching the reference alone — any divergence between
+        /// the two production paths will show up here.
+        #[test]
+        fn test_avx512_matches_scalar_standard() {
+            assert_avx512_matches_implicit(65536, 1024);
+        }
+
+        #[test]
+        fn test_avx512_matches_scalar_single_column() {
+            assert_avx512_matches_implicit(65536, 1);
+        }
+
+        #[test]
+        fn test_avx512_matches_scalar_non_power_of_two() {
+            assert_avx512_matches_implicit(65536, 100);
+        }
+
+        /// K > 1 sequential path.  Even when the `rayon` feature is
+        /// enabled, the AVX-512 kernel falls through to the sequential
+        /// column loop for K > 1 (the rayon path is currently K=1 only,
+        /// tracked in ZCA-256).  This test exercises that path.
+        #[test]
+        fn test_avx512_k2_sequential() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 256;
+            const K: usize = 2;
+
+            // Two query rows, concatenated: `a = [query0, query1]`.
+            let a0 = random_bounded_aligned(a_elems, params.modulus);
+            let a1 = random_bounded_aligned(a_elems, params.modulus);
+            let mut a = AlignedMemory64::new(K * a_elems);
+            a.as_mut_slice()[..a_elems].copy_from_slice(a0.as_slice());
+            a.as_mut_slice()[a_elems..].copy_from_slice(a1.as_slice());
+
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            // Reference: run K=1 kernel twice, one per batch row.
+            let mut c_ref0 = vec![0u64; b_cols];
+            let mut c_ref1 = vec![0u64; b_cols];
+            reference_dot_product_transposed_u16(
+                &params,
+                &mut c_ref0,
+                a0.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+            reference_dot_product_transposed_u16(
+                &params,
+                &mut c_ref1,
+                a1.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            // AVX-512 K=2: output is K*b_cols = 2*b_cols, laid out as
+            // [batch0_col0..batch0_col_{b_cols-1}, batch1_col0..].
+            let mut c_avx = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_explicit_avx512::<K, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            for j in 0..b_cols {
+                assert_eq!(
+                    c_avx.as_slice()[j], c_ref0[j],
+                    "AVX-512 K=2 batch 0 mismatch at column {j}"
+                );
+                assert_eq!(
+                    c_avx.as_slice()[b_cols + j], c_ref1[j],
+                    "AVX-512 K=2 batch 1 mismatch at column {j}"
+                );
+            }
+        }
+    }
 }
