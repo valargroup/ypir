@@ -47,10 +47,31 @@ use rayon::prelude::*;
 // drifting (e.g. a bugfix applied to three of four call sites).
 
 /// Split `a` (laid out as K batch-rows concatenated) into K equal-length
-/// slices.  Caller must ensure `a.len() % K == 0`; assertion is implicit in
-/// `chunks_exact`.
+/// sub-slices, each of length `a.len() / K`.
+///
+/// # Preconditions
+///
+/// - `a.len() % K == 0`.  The kernel callers always hold this invariant
+///   because they allocate `a` as `K * a_elems` and pass the whole slice.
+/// - `K > 0`.  `K == 0` would be a division by zero; debug-checked below.
+///
+/// Violating the length precondition silently drops the trailing
+/// `a.len() % K` elements (because `chunks_exact` discards the remainder)
+/// and the last batch row would not see them, producing silently wrong
+/// results.  We debug-assert to catch this in development builds; we
+/// deliberately do not check in release builds because this is called
+/// in the inner dispatch path of a hot kernel and the callers are fully
+/// controlled within this module.
 #[inline(always)]
 fn split_a<const K: usize>(a: &[u64]) -> [&[u64]; K] {
+    debug_assert!(K > 0, "split_a requires K > 0");
+    debug_assert_eq!(
+        a.len() % K,
+        0,
+        "split_a: a.len() ({}) must be a multiple of K ({})",
+        a.len(),
+        K
+    );
     let mut out: [&[u64]; K] = [&[]; K];
     for (slot, chunk) in out.iter_mut().zip(a.chunks_exact(a.len() / K)) {
         *slot = chunk;
@@ -60,11 +81,23 @@ fn split_a<const K: usize>(a: &[u64]) -> [&[u64]; K] {
 
 /// Finalize a single output cell from its two CRT half-sums.
 ///
-/// Applies Barrett reduction to each half (mod q0, mod q1), recomposes via
-/// CRT into a single element mod q, and accumulates into `*c_cell` with a
-/// final Barrett reduction so the stored value stays in `[0, q)`.
+/// Applies Barrett reduction to each half-sum (mod q0 and mod q1, the two
+/// CRT primes with q = q0 * q1), CRT-recomposes into a single element
+/// mod q, adds it to the pre-existing `*c_cell`, and applies a final
+/// Barrett reduction so the stored value remains in `[0, q)`.
 ///
 /// This is the common tail of both the scalar and AVX-512 kernels.
+///
+/// # Preconditions
+///
+/// - `*c_cell` is already in `[0, q)` before the call (i.e. the buffer
+///   was either zero-initialized by the caller, or previously written
+///   through this same function).  The final Barrett step only folds a
+///   single q-worth of carry, so violating this would leave `*c_cell`
+///   outside `[0, q)` and corrupt later accumulations.
+/// - `sum_lo`, `sum_hi` fit in `u64` (the inner loops tile the
+///   accumulation so this holds; see the `chunk_size` tuning in each
+///   kernel).
 #[inline(always)]
 fn writeback(params: &Params, c_cell: &mut u64, sum_lo: u64, sum_hi: u64) {
     let lo = barrett_coeff_u64(params, sum_lo, 0);
@@ -76,11 +109,24 @@ fn writeback(params: &Params, c_cell: &mut u64, sum_lo: u64, sum_hi: u64) {
 /// AVX-512 tail: horizontally reduce the two 512-bit accumulators to two
 /// `u64`s, then delegate to `writeback`.
 ///
+/// Stores each `__m512i` into an 8-lane `u64` scratch array on the stack
+/// and sums the lanes.  Accepts the same preconditions as `writeback` for
+/// the final scalar step.
+///
 /// # Safety
-/// Caller must be running on a CPU with AVX-512F.  The `__m512i` arguments
-/// are produced by `_mm512_setzero_si512` and subsequent
-/// `_mm512_add_epi64` / `_mm512_mul_epu32` calls; this helper only reads
-/// them via `_mm512_store_si512`.
+///
+/// - Caller must be running on a CPU with AVX-512F.  The `__m512i`
+///   arguments are produced by `_mm512_setzero_si512` and subsequent
+///   `_mm512_add_epi64` / `_mm512_mul_epu32` calls; this helper only
+///   reads them via `_mm512_store_si512`.
+/// - `_mm512_store_si512` is formally specified to require 64-byte
+///   alignment of the destination; the stack-allocated `[u64; 8]` here
+///   is only 8-byte aligned by Rust's type-alignment rules.  This has
+///   worked in practice (either because the stack happens to be more
+///   aligned, or because LLVM lowers to an unaligned store) and mirrors
+///   the pre-existing code — but it is a known latent issue worth
+///   fixing separately (e.g. by using `AlignedMemory64` or
+///   `_mm512_storeu_si512`).
 #[cfg(feature = "explicit_avx512")]
 #[inline(always)]
 unsafe fn writeback_avx512(
@@ -1100,6 +1146,18 @@ mod test {
             // Sanity: the one byte past the empty slice we allocated is
             // untouched, so the kernel did not write out of bounds.
             assert_eq!(c.as_slice()[0], c_before);
+        }
+
+        /// Edge case: `b_cols` exactly equals `num_threads`.
+        ///
+        /// With `cols_per_chunk = ceil(b_cols / num_threads) = 1`, every
+        /// rayon thread gets exactly one column.  This is the boundary
+        /// between "some threads get 2 cols" and "some threads get 0
+        /// cols" in the chunk-size arithmetic.
+        #[test]
+        fn test_rayon_implicit_b_cols_equal_num_threads() {
+            let num_threads = rayon::current_num_threads();
+            assert_rayon_matches_reference(65536, num_threads);
         }
 
         #[test]
