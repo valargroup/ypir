@@ -32,6 +32,46 @@ use std::arch::x86_64::*;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
 
+// ── Send/Sync raw-pointer newtype for rayon closures ───────────────────────
+//
+// Rayon's `par_chunks_mut().for_each(closure)` requires the closure to be
+// `Send + Sync`, which means any captured raw pointer must also be `Send +
+// Sync`.  Raw pointers are `!Send + !Sync` by default.  A common idiom is
+// to cast `ptr as usize` to smuggle the address across the boundary and
+// cast back inside the closure, but that pattern drops pointer provenance
+// and will fail under strict-provenance rules (tracked by Rust's strict-
+// provenance lint and already flagged by Miri under
+// `-Zmiri-strict-provenance`).
+//
+// Wrap the raw pointer in a `Copy` newtype with explicit `unsafe impl
+// Send + Sync`.  The safety obligation is the same as with the `as usize`
+// dance: (1) the pointee outlives the parallel region, (2) no aliasing
+// `&mut` exists for the duration, (3) writes through the pointer are
+// disjoint across threads.  Moving the `unsafe` here makes the contract
+// an attribute of the type rather than folklore spread across two
+// call sites.
+#[cfg(feature = "rayon")]
+#[derive(Copy, Clone)]
+struct SendPtr<T>(*const T);
+
+#[cfg(feature = "rayon")]
+unsafe impl<T> Send for SendPtr<T> {}
+#[cfg(feature = "rayon")]
+unsafe impl<T> Sync for SendPtr<T> {}
+
+#[cfg(feature = "rayon")]
+impl<T> SendPtr<T> {
+    /// Extract the inner raw pointer.  Takes `self` by value so that RFC
+    /// 2229 disjoint captures treats uses of `send_ptr.get()` as a whole-
+    /// struct access (method call on `Self`) rather than field access on
+    /// `.0` — the latter would cause the closure to capture `&*const T`,
+    /// which is `!Sync`, defeating the whole point of the newtype.
+    #[inline(always)]
+    fn get(self) -> *const T {
+        self.0
+    }
+}
+
 // ── Shared helpers ─────────────────────────────────────────────────────────
 //
 // Every kernel variant (AVX-512 / scalar × rayon / sequential) goes through
@@ -261,12 +301,14 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
     // ZCA-256 (https://linear.app/zcale/issue/ZCA-256), sub-issue of
     // ZCA-239 (PIR batch query).
     //
-    // Safety of the pointer casts:
+    // Safety of the pointer captures:
     //   - `a` and `b_t` are read-only for the entire duration of the
     //     parallel region; the caller holds &[u64] / &[T] borrows.
     //   - Each thread writes only to its own `c_chunk` (disjoint slices).
-    //   - Raw pointers are cast via usize to satisfy Send/Sync bounds on
-    //     the rayon closure; the underlying data outlives the closure.
+    //   - Raw pointers are wrapped in `SendPtr` (Copy + Send + Sync) so
+    //     the rayon closure can capture them while preserving provenance
+    //     (unlike the `as usize` / `as *const _` round-trip, which drops
+    //     it and breaks under strict-provenance rules / Miri).
     //
     // Edge cases:
     //   - b_cols not divisible by num_threads: the last chunk produced by
@@ -277,8 +319,8 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
     //     simply produces fewer chunks).
     #[cfg(feature = "rayon")]
     if K == 1 {
-        let b_addr: usize = b_t.as_ptr() as usize;
-        let a_addr: usize = a.as_ptr() as usize;
+        let b_send = SendPtr(b_t.as_ptr());
+        let a_send = SendPtr(a.as_ptr());
         let a_len = a.len();
         let num_threads = rayon::current_num_threads();
         // `.max(1)` so `par_chunks_mut` never gets a zero chunk size — it
@@ -287,13 +329,18 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
         // no-op, which is the correct result.
         let cols_per_chunk = ((b_cols + num_threads - 1) / num_threads).max(1);
 
+        // `move` plus the `SendPtr::get` accessor (taking `self` by
+        // value) forces RFC 2229 to capture the whole `SendPtr` — which
+        // is `Send + Sync` via its unsafe impl — rather than the inner
+        // `*const _` field in isolation, which is `!Send + !Sync` and
+        // would cause the closure to fail rayon's bounds.
         c.par_chunks_mut(cols_per_chunk)
             .enumerate()
-            .for_each(|(chunk_idx, c_chunk)| {
+            .for_each(move |(chunk_idx, c_chunk)| {
                 let j_start = chunk_idx * cols_per_chunk;
                 unsafe {
-                    let b_ptr = b_addr as *const T;
-                    let a_slice = std::slice::from_raw_parts(a_addr as *const u64, a_len);
+                    let b_ptr = b_send.get();
+                    let a_slice = std::slice::from_raw_parts(a_send.get(), a_len);
                     let a_slcs = split_a::<K>(a_slice);
 
                     // Outer loop over row chunks (accumulation dimension).
@@ -440,21 +487,23 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
     // Safety / threading notes are the same as the AVX-512 rayon block.
     #[cfg(feature = "rayon")]
     {
-        let b_addr: usize = b_t.as_ptr() as usize;
-        let a_addr: usize = a.as_ptr() as usize;
+        let b_send = SendPtr(b_t.as_ptr());
+        let a_send = SendPtr(a.as_ptr());
         let a_len = a.len();
         let num_threads = rayon::current_num_threads();
         // See the matching comment in the AVX-512 path above for why
         // `.max(1)` is needed.
         let cols_per_chunk = ((b_cols + num_threads - 1) / num_threads).max(1);
 
+        // `move` + `SendPtr::get()`: see matching comment in the AVX-512
+        // path for why we can't access `.0` directly here.
         c.par_chunks_mut(cols_per_chunk)
             .enumerate()
-            .for_each(|(chunk_idx, c_chunk)| {
+            .for_each(move |(chunk_idx, c_chunk)| {
                 let j_start = chunk_idx * cols_per_chunk;
                 unsafe {
-                    let b_ptr = b_addr as *const T;
-                    let a_slice = std::slice::from_raw_parts(a_addr as *const u64, a_len);
+                    let b_ptr = b_send.get();
+                    let a_slice = std::slice::from_raw_parts(a_send.get(), a_len);
                     let a_slcs = split_a::<K>(a_slice);
 
                     for k_outer in 0..num_chunks {
