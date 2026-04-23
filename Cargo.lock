@@ -2209,7 +2209,8 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "valar-spiral-rs"
 version = "0.5.1"
-source = "git+https://github.com/valargroup/spiral-rs?rev=3a5132f#3a5132f2d79b5fa1681cf66cf1d2683a0f187de6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c501f15052c202b2c9934226b1b16572e7ee6dfe77c014b6782e2580f205417a"
 dependencies = [
  "fastrand",
  "getrandom 0.2.17",
@@ -2222,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "valar-ypir"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "actix-cors",
  "actix-http",
