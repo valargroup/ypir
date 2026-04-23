@@ -270,8 +270,9 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
     //
     // Edge cases:
     //   - b_cols not divisible by num_threads: the last chunk produced by
-    //     `par_chunks_mut` is shorter; the `j >= b_cols` guard is
-    //     redundant but kept as a safety net.
+    //     `par_chunks_mut` is shorter; `j < b_cols` still holds because
+    //     `par_chunks_mut` never hands out indices past `c.len()`, which
+    //     equals `b_cols` for K=1.  A `debug_assert!` locks this in.
     //   - b_cols < num_threads: some chunks are empty (par_chunks_mut
     //     simply produces fewer chunks).
     #[cfg(feature = "rayon")]
@@ -301,9 +302,10 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
                     for k_outer in 0..num_chunks {
                         for (j_local, c_cell) in c_chunk.iter_mut().enumerate() {
                             let j = j_start + j_local;
-                            if j >= b_cols {
-                                break;
-                            }
+                            debug_assert!(
+                                j < b_cols,
+                                "par_chunks_mut partition invariant broken: j={j} >= b_cols={b_cols}"
+                            );
 
                             let mut total_sum_lo = [_mm512_setzero_si512(); K];
                             let mut total_sum_hi = [_mm512_setzero_si512(); K];
@@ -458,9 +460,10 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
                     for k_outer in 0..num_chunks {
                         for (j_local, c_cell) in c_chunk.iter_mut().enumerate() {
                             let j = j_start + j_local;
-                            if j >= b_cols {
-                                break;
-                            }
+                            debug_assert!(
+                                j < b_cols,
+                                "par_chunks_mut partition invariant broken: j={j} >= b_cols={b_cols}"
+                            );
 
                             let mut total_sum_lo = [0u64; K];
                             let mut total_sum_hi = [0u64; K];
