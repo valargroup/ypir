@@ -492,29 +492,32 @@ impl<'a> YClient<'a> {
         )
     }
 
-    fn generate_full_query_simplepir(
+    /// Build the YPIR `pack_pub_params` blob (`query.1` on the wire).
+    ///
+    /// Default behavior is identical to the inline construction previously
+    /// embedded in [`generate_full_query_simplepir`]: the secret RNG is drawn
+    /// from `OsRng` (`ChaCha20Rng::from_entropy()`), so two calls under the
+    /// same `client_seed` produce *different* `pp` blobs (each batch gets a
+    /// fresh `pp`). The public RNG is seeded from the deterministic
+    /// [`STATIC_SEED_2`] so the server's view of the public stream is fixed.
+    fn build_pack_pub_params(&self) -> AlignedMemory64 {
+        self.build_pack_pub_params_with_secret_rng(&mut ChaCha20Rng::from_entropy())
+    }
+
+    /// [`build_pack_pub_params`] with the secret RNG injected. Intended for
+    /// tests that need byte-deterministic `pp` output. Production callers go
+    /// through [`build_pack_pub_params`] which uses `OsRng` entropy.
+    fn build_pack_pub_params_with_secret_rng(
         &self,
-        target_idx: u64,
-    ) -> (AlignedMemory64, AlignedMemory64) {
-        // setup
-        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
-        let db_cols = self.params.instances * self.params.poly_len;
-
-        let target_row = (target_idx / db_cols as u64) as usize;
-        let target_col = (target_idx % db_cols as u64) as usize;
-        debug!(
-            "Target item: {} ({}, {})",
-            target_idx, target_row, target_col
-        );
-
-        // generate pub params
+        secret_rng: &mut ChaCha20Rng,
+    ) -> AlignedMemory64 {
         let sk_reg = self.client().get_sk_reg();
         let pack_pub_params = raw_generate_expansion_params(
             self.params,
             &sk_reg,
             self.params.poly_len_log2,
             self.params.t_exp_left,
-            &mut ChaCha20Rng::from_entropy(),
+            secret_rng,
             &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
         );
         // let pub_params_size = get_vec_pm_size_bytes(&pack_pub_params) / 2;
@@ -539,6 +542,25 @@ impl<'a> YClient<'a> {
                 * self.params.poly_len
                 * std::mem::size_of::<u64>()
         );
+        pack_pub_params_row_1s_pm
+    }
+
+    fn generate_full_query_simplepir(
+        &self,
+        target_idx: u64,
+    ) -> (AlignedMemory64, AlignedMemory64) {
+        // setup
+        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
+        let db_cols = self.params.instances * self.params.poly_len;
+
+        let target_row = (target_idx / db_cols as u64) as usize;
+        let target_col = (target_idx % db_cols as u64) as usize;
+        debug!(
+            "Target item: {} ({}, {})",
+            target_idx, target_row, target_col
+        );
+
+        let pack_pub_params_row_1s_pm = self.build_pack_pub_params();
 
         // generate query
         // NB: made this low memory
@@ -553,6 +575,41 @@ impl<'a> YClient<'a> {
         assert_eq!(packed_query_row.len(), self.params.db_rows());
 
         (packed_query_row, pack_pub_params_row_1s_pm)
+    }
+
+    /// Batched analogue of [`generate_full_query_simplepir`]. Builds
+    /// `pack_pub_params` once for the whole batch and one `q.0` per target
+    /// row, all under the same `sk_reg` (same `client_seed`).
+    ///
+    /// Each per-row `q.0` still draws its own fresh `from_entropy()` secret
+    /// RNG inside [`generate_query_lwe_low_mem`], so the LWE error vectors
+    /// `e_k` remain independent across the K queries even though `s` is
+    /// shared.
+    fn generate_full_query_simplepir_batch(
+        &self,
+        target_rows: &[usize],
+    ) -> (Vec<AlignedMemory64>, AlignedMemory64) {
+        let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
+
+        let pack_pub_params_row_1s_pm = self.build_pack_pub_params();
+
+        let queries = target_rows
+            .iter()
+            .map(|&target_row| {
+                let q_last_row = self.generate_query_lwe_low_mem(
+                    SEED_0,
+                    self.params.db_dim_1,
+                    true,
+                    target_row,
+                );
+                assert_eq!(q_last_row.len(), db_rows);
+                let packed = pack_query(self.params, &q_last_row);
+                assert_eq!(packed.len(), self.params.db_rows());
+                packed
+            })
+            .collect();
+
+        (queries, pack_pub_params_row_1s_pm)
     }
 
     fn lwe_params(&self) -> &LWEParams {
@@ -595,6 +652,10 @@ pub struct YPIRClient {
 
 pub type YPIRQuery = (Vec<u32>, AlignedMemory64, AlignedMemory64);
 pub type YPIRSimpleQuery = (AlignedMemory64, AlignedMemory64);
+/// Output of [`YPIRClient::generate_query_simplepir_batch`]: K SimplePIR
+/// `q.0` query vectors plus a single shared `pack_pub_params` (`q.1`)
+/// generated under one `client_seed`.
+pub type YPIRSimpleBatchQuery = (Vec<AlignedMemory64>, AlignedMemory64);
 
 pub const SHA1_HASH_BYTES: usize = 20;
 
@@ -672,6 +733,66 @@ impl YPIRClient {
         client.generate_secret_keys_from_seed(client_seed);
         let y_client = YClient::from_seed(&mut client, &self.params, client_seed);
         YPIRClient::decode_response_simplepir_yclient(&self.params, &y_client, response_data)
+    }
+
+    /// Batched analogue of [`generate_query_simplepir`]. Generates K SimplePIR
+    /// queries that share one `pack_pub_params` and one `client_seed` (one
+    /// `s`). Per-query LWE error vectors `e_k` remain independent because
+    /// each `q.0` is generated with a fresh `OsRng` secret RNG.
+    ///
+    /// Callers (e.g. `pir-client`'s upcoming `client_batch_query`) should
+    /// generate a fresh batch — and therefore a fresh `client_seed` — for
+    /// every delegation, never reusing `client_seed` across batches.
+    pub fn generate_query_simplepir_batch(
+        &self,
+        target_rows: &[usize],
+    ) -> (YPIRSimpleBatchQuery, Seed) {
+        for &row in target_rows {
+            assert!(row < self.params.db_rows());
+        }
+        let client_seed = generate_secure_random_seed();
+        let mut client = Client::init(&self.params);
+        client.generate_secret_keys_from_seed(client_seed);
+        let y_client = YClient::from_seed(&mut client, &self.params, client_seed);
+        let query = y_client.generate_full_query_simplepir_batch(target_rows);
+        (query, client_seed)
+    }
+
+    /// Batched analogue of [`decode_response_simplepir`]. Decodes K
+    /// independent SimplePIR responses under one shared `client_seed`,
+    /// returning the per-query plaintext byte streams.
+    ///
+    /// Each response chunk decodes independently — the K decodes share one
+    /// `YClient` (one `s`) but are otherwise unrelated, so a malformed or
+    /// adversarial response in one slot cannot poison decoding of the
+    /// others. (Panics inside the LWE decode path remain caller-handled;
+    /// `pir-client` wraps each response decode in `catch_unwind` to keep
+    /// the error-oracle mitigation working under shared `s`.)
+    pub fn decode_response_simplepir_batch(
+        &self,
+        client_seed: Seed,
+        responses: &[&[u8]],
+    ) -> Vec<Vec<u8>> {
+        let raws = self.decode_response_simplepir_batch_raw(client_seed, responses);
+        raws.into_iter()
+            .map(|r| u64s_to_contiguous_bytes(&r, self.params.pt_modulus_bits()))
+            .collect()
+    }
+
+    /// Raw (`Vec<u64>`-per-response) variant of
+    /// [`decode_response_simplepir_batch`].
+    pub fn decode_response_simplepir_batch_raw(
+        &self,
+        client_seed: Seed,
+        responses: &[&[u8]],
+    ) -> Vec<Vec<u64>> {
+        let mut client = Client::init(&self.params);
+        client.generate_secret_keys_from_seed(client_seed);
+        let y_client = YClient::from_seed(&mut client, &self.params, client_seed);
+        responses
+            .iter()
+            .map(|r| YPIRClient::decode_response_simplepir_yclient(&self.params, &y_client, r))
+            .collect()
     }
 
     fn decode_response_normal_yclient(
@@ -1703,5 +1824,228 @@ mod sp_decode_pipeline_tests {
             assert_eq!(decoded[0], expected_val,
                 "trial {trial}: first coeff should be {expected_val}, got {}", decoded[0]);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Area 3: Batch-path tests (shared `pp` + shared `s` per batch)
+// ---------------------------------------------------------------------------
+//
+// * The new batch path is purely additive — the single-query path is
+//   not exercised here, but the `build_pack_pub_params` hoist is byte-faithful
+//   given the same secret RNG.
+// * One `pack_pub_params` is returned per batch and K independent `q.0`
+//   vectors share it (and one `client_seed`).
+// * Each per-row `q.0` draws fresh `OsRng` entropy so the LWE error vectors
+//   `e_k` remain independent under the shared `s`.
+// * Per-chunk decoding is independent: decoding three chunks together gives
+//   the same per-chunk plaintexts as decoding each chunk alone.
+#[cfg(test)]
+mod batch_path_tests {
+    use super::*;
+    use crate::bits::contiguous_bytes_to_u64s;
+    use crate::modulus_switch::ModulusSwitch;
+    use crate::params::{params_for_scenario_simplepir, GetQPrime, PtModulusBits};
+
+    fn sp_params() -> Params {
+        params_for_scenario_simplepir(1 << 14, 2048 * 14)
+    }
+
+    fn fixed_seed() -> Seed {
+        [42u8; 32]
+    }
+
+    /// Synthesise a SimplePIR server response that decodes (under
+    /// `client_seed`) to the given `expected_vals` (length must equal
+    /// `params.instances * params.poly_len`). Used in place of running an
+    /// actual server roundtrip — same approach as
+    /// `sp_decode_full_pipeline_with_byte_conversion`.
+    fn synth_simplepir_response(params: &Params, client_seed: Seed, expected_vals: &[u64]) -> Vec<u8> {
+        let q1 = params.get_q_prime_1();
+        let q2 = params.get_q_prime_2();
+        let scale_k = params.modulus / params.pt_modulus;
+        let num_rlwe_outputs = params.instances;
+        assert_eq!(expected_vals.len(), num_rlwe_outputs * params.poly_len,
+            "synth_simplepir_response expects instances * poly_len plaintexts");
+
+        let mut client = Client::init(params);
+        client.generate_secret_keys_from_seed(client_seed);
+
+        let mut response_bytes = Vec::new();
+        for inst in 0..num_rlwe_outputs {
+            let mut pt = PolyMatrixRaw::zero(params, 1, 1);
+            for z in 0..params.poly_len {
+                pt.data[z] = expected_vals[inst * params.poly_len + z] * scale_k;
+            }
+            let ct = client.encrypt_matrix_reg(
+                &pt.ntt(),
+                &mut ChaCha20Rng::from_entropy(),
+                &mut ChaCha20Rng::from_entropy(),
+            );
+            response_bytes.extend_from_slice(&ct.raw().switch(q1, q2));
+        }
+        response_bytes
+    }
+
+    #[test]
+    fn batch_query_returns_k_queries_and_one_pp() {
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let target_rows = vec![0usize, 1, 2, 7, 13];
+        let ((q_vec, pp), _seed) = ypir.generate_query_simplepir_batch(&target_rows);
+
+        assert_eq!(q_vec.len(), target_rows.len(),
+            "batch should return K query vectors");
+
+        let expected_pp_words = params.poly_len_log2 * params.t_exp_left * params.poly_len;
+        assert_eq!(pp.as_slice().len(), expected_pp_words,
+            "pp must satisfy the build_pack_pub_params length invariant");
+
+        for q in &q_vec {
+            assert_eq!(q.as_slice().len(), params.db_rows(),
+                "each per-row q.0 should have db_rows entries");
+        }
+    }
+
+    #[test]
+    fn batch_query_pp_matches_under_fixed_secret_rng() {
+        // The §0.5.2 hoist of `build_pack_pub_params` is byte-faithful: given
+        // the same client_seed and the same secret-RNG seed, two calls
+        // produce identical pp bytes. This guards against accidental
+        // behavior change in the legacy single-query path.
+        let params = sp_params();
+        let seed = fixed_seed();
+        let secret_rng_seed = [99u8; 32];
+
+        let pp1 = {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            let mut rng = ChaCha20Rng::from_seed(secret_rng_seed);
+            y_client.build_pack_pub_params_with_secret_rng(&mut rng)
+        };
+        let pp2 = {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            let mut rng = ChaCha20Rng::from_seed(secret_rng_seed);
+            y_client.build_pack_pub_params_with_secret_rng(&mut rng)
+        };
+        assert_eq!(pp1.as_slice(), pp2.as_slice(),
+            "build_pack_pub_params_with_secret_rng must be deterministic given (client_seed, secret_rng_seed)");
+
+        // Sanity: a different secret RNG seed produces a different pp blob.
+        let pp3 = {
+            let mut client = Client::init(&params);
+            client.generate_secret_keys_from_seed(seed);
+            let y_client = YClient::from_seed(&mut client, &params, seed);
+            let mut rng = ChaCha20Rng::from_seed([100u8; 32]);
+            y_client.build_pack_pub_params_with_secret_rng(&mut rng)
+        };
+        assert_ne!(pp1.as_slice(), pp3.as_slice(),
+            "different secret RNG seeds should produce different pp blobs");
+    }
+
+    #[test]
+    fn batch_query_each_q_decodes_independently() {
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let pt_modulus = params.pt_modulus;
+        let poly_len = params.poly_len;
+        let num_rlwe_outputs = params.instances;
+        let pt_bits = params.pt_modulus_bits();
+
+        // K different expected plaintext patterns — one per query in the batch.
+        const K: usize = 4;
+        let expected_per_query: Vec<Vec<u64>> = (0..K).map(|k| {
+            (0..(num_rlwe_outputs * poly_len))
+                .map(|i| ((k as u64 + 1) * 17 * (i as u64 + 1)) % pt_modulus)
+                .collect()
+        }).collect();
+
+        // We only need the client_seed from the batch query — pp and q vectors
+        // are not used because we synthesise responses out-of-band, exactly
+        // like sp_decode_pipeline_tests does.
+        let target_rows: Vec<usize> = (0..K).map(|k| k * 3).collect();
+        let (_query, client_seed) = ypir.generate_query_simplepir_batch(&target_rows);
+
+        let response_bytes_per_query: Vec<Vec<u8>> = expected_per_query.iter()
+            .map(|expected| synth_simplepir_response(&params, client_seed, expected))
+            .collect();
+        let response_refs: Vec<&[u8]> = response_bytes_per_query.iter()
+            .map(|v| v.as_slice())
+            .collect();
+
+        let raws = ypir.decode_response_simplepir_batch_raw(client_seed, &response_refs);
+        assert_eq!(raws.len(), K);
+        for (k, (got, expected)) in raws.iter().zip(expected_per_query.iter()).enumerate() {
+            assert_eq!(got, expected, "batch decode mismatch on query {k}");
+        }
+
+        let bytes = ypir.decode_response_simplepir_batch(client_seed, &response_refs);
+        assert_eq!(bytes.len(), K);
+        for (k, (got_bytes, expected)) in bytes.iter().zip(expected_per_query.iter()).enumerate() {
+            let recovered = contiguous_bytes_to_u64s(got_bytes, pt_bits);
+            assert_eq!(&recovered[..expected.len()], expected.as_slice(),
+                "batch decode (byte variant) mismatch on query {k}");
+        }
+    }
+
+    #[test]
+    fn batch_query_distinct_secret_rngs_produce_distinct_q() {
+        // Same target row queried K times in one batch must yield K different
+        // `q.0` byte streams because each per-row call to
+        // `generate_query_lwe_low_mem` draws fresh OsRng entropy. This pins
+        // the noise-freshness invariant the shared-`s` security argument
+        // relies on (§0.5.4 / earlier discussion).
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let target_rows = vec![5usize; 3];
+        let ((q_vec, _pp), _seed) = ypir.generate_query_simplepir_batch(&target_rows);
+        assert_ne!(q_vec[0].as_slice(), q_vec[1].as_slice(),
+            "two queries for the same row must differ (independent e_k)");
+        assert_ne!(q_vec[0].as_slice(), q_vec[2].as_slice());
+        assert_ne!(q_vec[1].as_slice(), q_vec[2].as_slice());
+    }
+
+    #[test]
+    fn batch_decode_chunk_independence() {
+        // Decoding three chunks together must produce the same per-chunk
+        // plaintexts as decoding each chunk alone. This pins the "no
+        // coupling" property the §0.5.5 batch error-oracle argument depends
+        // on: under shared `s`, a malformed/different chunk in one slot
+        // must not change decode output of any other slot.
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let pt_modulus = params.pt_modulus;
+        let poly_len = params.poly_len;
+        let num_rlwe_outputs = params.instances;
+        let n = num_rlwe_outputs * poly_len;
+
+        let expected_0: Vec<u64> = (0..n).map(|i| (i as u64) % pt_modulus).collect();
+        let expected_1: Vec<u64> = (0..n).map(|i| ((i as u64 * 5) + 1) % pt_modulus).collect();
+        let expected_2: Vec<u64> = (0..n).map(|i| ((i as u64 * 7) + 3) % pt_modulus).collect();
+
+        let target_rows = vec![0usize, 1, 2];
+        let (_query, client_seed) = ypir.generate_query_simplepir_batch(&target_rows);
+        let r0 = synth_simplepir_response(&params, client_seed, &expected_0);
+        let r1 = synth_simplepir_response(&params, client_seed, &expected_1);
+        let r2 = synth_simplepir_response(&params, client_seed, &expected_2);
+
+        let alone_0 = ypir.decode_response_simplepir_raw(client_seed, &r0);
+        let alone_1 = ypir.decode_response_simplepir_raw(client_seed, &r1);
+        let alone_2 = ypir.decode_response_simplepir_raw(client_seed, &r2);
+
+        let response_refs: Vec<&[u8]> = vec![r0.as_slice(), r1.as_slice(), r2.as_slice()];
+        let batch = ypir.decode_response_simplepir_batch_raw(client_seed, &response_refs);
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0], alone_0, "batch slot 0 must match standalone decode");
+        assert_eq!(batch[1], alone_1, "batch slot 1 must match standalone decode");
+        assert_eq!(batch[2], alone_2, "batch slot 2 must match standalone decode");
+
+        assert_eq!(batch[0], expected_0);
+        assert_eq!(batch[1], expected_1);
+        assert_eq!(batch[2], expected_2);
     }
 }
