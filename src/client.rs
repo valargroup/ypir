@@ -1,6 +1,7 @@
 use log::debug;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use std::{error::Error, fmt, panic};
 
 use sha1::{Digest, Sha1};
 use spiral_rs::aligned_memory::AlignedMemory64;
@@ -17,6 +18,31 @@ use crate::serialize::*;
 
 use super::convolution::negacyclic_matrix_u32;
 use super::{constants::*, lwe::*, noise_analysis::measure_noise_width_squared, util::*};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YPIRDecodeError {
+    Panic(String),
+}
+
+impl fmt::Display for YPIRDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            YPIRDecodeError::Panic(msg) => write!(f, "response decoding panicked: {msg}"),
+        }
+    }
+}
+
+impl Error for YPIRDecodeError {}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "unknown panic".to_string(),
+        },
+    }
+}
 
 pub fn rlwe_to_lwe<'a>(params: &'a Params, ct: &PolyMatrixRaw<'a>) -> Vec<u64> {
     let a = ct.get_poly(0, 0);
@@ -760,22 +786,20 @@ impl YPIRClient {
 
     /// Batched analogue of [`decode_response_simplepir`]. Decodes K
     /// independent SimplePIR responses under one shared `client_seed`,
-    /// returning the per-query plaintext byte streams.
+    /// returning the per-query plaintext byte streams or per-query errors.
     ///
-    /// Each response chunk decodes independently — the K decodes share one
-    /// `YClient` (one `s`) but are otherwise unrelated, so a malformed or
-    /// adversarial response in one slot cannot poison decoding of the
-    /// others. (Panics inside the LWE decode path remain caller-handled;
-    /// `pir-client` wraps each response decode in `catch_unwind` to keep
-    /// the error-oracle mitigation working under shared `s`.)
+    /// Each response chunk decodes independently. The K decodes share one
+    /// `YClient` (one `s`) but each slot is wrapped in `catch_unwind`, so a
+    /// malformed or adversarial response in one slot returns `Err` for that
+    /// slot without preventing later slots from decoding.
     pub fn decode_response_simplepir_batch(
         &self,
         client_seed: Seed,
         responses: &[&[u8]],
-    ) -> Vec<Vec<u8>> {
+    ) -> Vec<Result<Vec<u8>, YPIRDecodeError>> {
         let raws = self.decode_response_simplepir_batch_raw(client_seed, responses);
         raws.into_iter()
-            .map(|r| u64s_to_contiguous_bytes(&r, self.params.pt_modulus_bits()))
+            .map(|r| r.map(|raw| u64s_to_contiguous_bytes(&raw, self.params.pt_modulus_bits())))
             .collect()
     }
 
@@ -785,13 +809,18 @@ impl YPIRClient {
         &self,
         client_seed: Seed,
         responses: &[&[u8]],
-    ) -> Vec<Vec<u64>> {
+    ) -> Vec<Result<Vec<u64>, YPIRDecodeError>> {
         let mut client = Client::init(&self.params);
         client.generate_secret_keys_from_seed(client_seed);
         let y_client = YClient::from_seed(&mut client, &self.params, client_seed);
         responses
             .iter()
-            .map(|r| YPIRClient::decode_response_simplepir_yclient(&self.params, &y_client, r))
+            .map(|r| {
+                panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    YPIRClient::decode_response_simplepir_yclient(&self.params, &y_client, r)
+                }))
+                .map_err(|payload| YPIRDecodeError::Panic(panic_payload_message(payload)))
+            })
             .collect()
     }
 
@@ -1979,12 +2008,18 @@ mod batch_path_tests {
         let raws = ypir.decode_response_simplepir_batch_raw(client_seed, &response_refs);
         assert_eq!(raws.len(), K);
         for (k, (got, expected)) in raws.iter().zip(expected_per_query.iter()).enumerate() {
+            let got = got
+                .as_ref()
+                .unwrap_or_else(|err| panic!("batch decode slot {k} failed: {err}"));
             assert_eq!(got, expected, "batch decode mismatch on query {k}");
         }
 
         let bytes = ypir.decode_response_simplepir_batch(client_seed, &response_refs);
         assert_eq!(bytes.len(), K);
         for (k, (got_bytes, expected)) in bytes.iter().zip(expected_per_query.iter()).enumerate() {
+            let got_bytes = got_bytes
+                .as_ref()
+                .unwrap_or_else(|err| panic!("batch byte decode slot {k} failed: {err}"));
             let recovered = contiguous_bytes_to_u64s(got_bytes, pt_bits);
             assert_eq!(&recovered[..expected.len()], expected.as_slice(),
                 "batch decode (byte variant) mismatch on query {k}");
@@ -2040,12 +2075,40 @@ mod batch_path_tests {
         let batch = ypir.decode_response_simplepir_batch_raw(client_seed, &response_refs);
 
         assert_eq!(batch.len(), 3);
-        assert_eq!(batch[0], alone_0, "batch slot 0 must match standalone decode");
-        assert_eq!(batch[1], alone_1, "batch slot 1 must match standalone decode");
-        assert_eq!(batch[2], alone_2, "batch slot 2 must match standalone decode");
+        let batch_0 = batch[0].as_ref().expect("batch slot 0 should decode");
+        let batch_1 = batch[1].as_ref().expect("batch slot 1 should decode");
+        let batch_2 = batch[2].as_ref().expect("batch slot 2 should decode");
+        assert_eq!(batch_0, &alone_0, "batch slot 0 must match standalone decode");
+        assert_eq!(batch_1, &alone_1, "batch slot 1 must match standalone decode");
+        assert_eq!(batch_2, &alone_2, "batch slot 2 must match standalone decode");
 
-        assert_eq!(batch[0], expected_0);
-        assert_eq!(batch[1], expected_1);
-        assert_eq!(batch[2], expected_2);
+        assert_eq!(batch_0, &expected_0);
+        assert_eq!(batch_1, &expected_1);
+        assert_eq!(batch_2, &expected_2);
+    }
+
+    #[test]
+    fn batch_decode_returns_per_slot_error_for_malformed_chunk() {
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let pt_modulus = params.pt_modulus;
+        let n = params.instances * params.poly_len;
+
+        let expected_0: Vec<u64> = (0..n).map(|i| ((i as u64 * 3) + 2) % pt_modulus).collect();
+        let expected_2: Vec<u64> = (0..n).map(|i| ((i as u64 * 11) + 7) % pt_modulus).collect();
+
+        let target_rows = vec![0usize, 1, 2];
+        let (_query, client_seed) = ypir.generate_query_simplepir_batch(&target_rows);
+        let r0 = synth_simplepir_response(&params, client_seed, &expected_0);
+        let malformed = vec![0xFFu8];
+        let r2 = synth_simplepir_response(&params, client_seed, &expected_2);
+
+        let response_refs: Vec<&[u8]> = vec![r0.as_slice(), malformed.as_slice(), r2.as_slice()];
+        let batch = ypir.decode_response_simplepir_batch_raw(client_seed, &response_refs);
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].as_ref().expect("slot 0 should decode"), &expected_0);
+        assert!(batch[1].is_err(), "malformed slot should return an error");
+        assert_eq!(batch[2].as_ref().expect("slot 2 should decode"), &expected_2);
     }
 }
