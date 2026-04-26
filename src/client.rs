@@ -19,6 +19,10 @@ use crate::serialize::*;
 use super::convolution::negacyclic_matrix_u32;
 use super::{constants::*, lwe::*, noise_analysis::measure_noise_width_squared, util::*};
 
+/// Arbitrary conservative cap for generally usable batch APIs; the shared-`s`
+/// security argument becomes less comfortable as K grows.
+pub const MAX_SIMPLEPIR_BATCH_K: usize = 20;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YPIRDecodeError {
     Panic(String),
@@ -769,10 +773,13 @@ impl YPIRClient {
     /// Callers (e.g. `pir-client`'s upcoming `client_batch_query`) should
     /// generate a fresh batch — and therefore a fresh `client_seed` — for
     /// every delegation, never reusing `client_seed` across batches.
+    ///
+    /// Batch size is capped at [`MAX_SIMPLEPIR_BATCH_K`].
     pub fn generate_query_simplepir_batch(
         &self,
         target_rows: &[usize],
     ) -> (YPIRSimpleBatchQuery, Seed) {
+        assert!(target_rows.len() <= MAX_SIMPLEPIR_BATCH_K);
         for &row in target_rows {
             assert!(row < self.params.db_rows());
         }
@@ -1934,6 +1941,27 @@ mod batch_path_tests {
             assert_eq!(q.as_slice().len(), params.db_rows(),
                 "each per-row q.0 should have db_rows entries");
         }
+    }
+
+    #[test]
+    fn batch_query_accepts_max_k() {
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let target_rows: Vec<usize> = (0..MAX_SIMPLEPIR_BATCH_K).collect();
+
+        let ((q_vec, _pp), _seed) = ypir.generate_query_simplepir_batch(&target_rows);
+
+        assert_eq!(q_vec.len(), MAX_SIMPLEPIR_BATCH_K);
+    }
+
+    #[test]
+    #[should_panic]
+    fn batch_query_panics_above_max_k() {
+        let params = sp_params();
+        let ypir = YPIRClient::new(&params);
+        let target_rows: Vec<usize> = (0..=MAX_SIMPLEPIR_BATCH_K).collect();
+
+        let _ = ypir.generate_query_simplepir_batch(&target_rows);
     }
 
     #[test]
