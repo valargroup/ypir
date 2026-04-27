@@ -440,7 +440,6 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
 ///
 /// Same mathematical operation as the AVX-512 variant but using plain
 /// u64 arithmetic (one element per iteration instead of eight).
-/// Only supports K=1.
 pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
     params: &Params,
     c: &mut [u64],
@@ -453,6 +452,7 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
     *const T: ToM512 + ToU64,
 {
     assert_eq!(a_elems, b_rows);
+    #[cfg(feature = "rayon")]
     assert_eq!(K, 1);
 
     let simd_width = 1; // scalar: one element per iteration
@@ -836,6 +836,32 @@ mod test {
         }
     }
 
+    fn reference_batched_dot_product_u16<const K: usize>(
+        params: &Params,
+        c: &mut [u64],
+        a: &[u64],
+        a_elems: usize,
+        b_t: &[u16],
+        b_rows: usize,
+        b_cols: usize,
+    ) {
+        assert_eq!(a.len(), K * a_elems);
+        assert_eq!(c.len(), K * b_cols);
+        let a_rows = split_a::<K>(a);
+
+        for (batch, c_row) in c.chunks_exact_mut(b_cols).enumerate() {
+            reference_dot_product_transposed_u16(
+                params,
+                c_row,
+                a_rows[batch],
+                a_elems,
+                b_t,
+                b_rows,
+                b_cols,
+            );
+        }
+    }
+
     /// Helper: builds aligned u64 data (needed by AVX-512 which requires
     /// 64-byte alignment for _mm512_load_si512).
     fn random_bounded_aligned(len: usize, bound: u64) -> AlignedMemory64 {
@@ -890,6 +916,94 @@ mod test {
                 c_impl.as_slice()[j], c_ref[j]
             );
         }
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    fn assert_implicit_k5_matches_reference(a_elems: usize, b_cols: usize) {
+        let params = test_params();
+        const K: usize = 5;
+
+        let a = random_bounded_aligned(K * a_elems, params.modulus);
+        let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+        let mut c_ref = vec![0u64; K * b_cols];
+        reference_batched_dot_product_u16::<K>(
+            &params,
+            &mut c_ref,
+            a.as_slice(),
+            a_elems,
+            &b_t_u16,
+            a_elems,
+            b_cols,
+        );
+
+        let mut c_impl = AlignedMemory64::new(K * b_cols);
+        fast_batched_dot_product_implicit::<K, _>(
+            &params,
+            c_impl.as_mut_slice(),
+            a.as_slice(),
+            a_elems,
+            &b_t_u16,
+            a_elems,
+            b_cols,
+        );
+
+        assert_eq!(
+            c_impl.as_slice(),
+            c_ref.as_slice(),
+            "implicit K=5 mismatch (a_elems={a_elems}, b_cols={b_cols})"
+        );
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    #[test]
+    fn test_implicit_k5_matches_reference() {
+        assert_implicit_k5_matches_reference(65536, 1024);
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    #[test]
+    fn test_implicit_k5_modulus_boundary() {
+        let params = test_params();
+        let a_elems = 65536;
+        let b_cols = 32;
+        const K: usize = 5;
+
+        let mut a = AlignedMemory64::new(K * a_elems);
+        for i in 0..K * a_elems {
+            a[i] = params.modulus - 1;
+        }
+        let b_t_u16: Vec<u16> = vec![u16::MAX; a_elems * b_cols];
+
+        let mut c_ref = vec![0u64; K * b_cols];
+        reference_batched_dot_product_u16::<K>(
+            &params,
+            &mut c_ref,
+            a.as_slice(),
+            a_elems,
+            &b_t_u16,
+            a_elems,
+            b_cols,
+        );
+
+        let mut c_impl = AlignedMemory64::new(K * b_cols);
+        fast_batched_dot_product_implicit::<K, _>(
+            &params,
+            c_impl.as_mut_slice(),
+            a.as_slice(),
+            a_elems,
+            &b_t_u16,
+            a_elems,
+            b_cols,
+        );
+
+        assert_eq!(c_impl.as_slice(), c_ref.as_slice());
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    #[test]
+    fn test_implicit_k5_single_column() {
+        assert_implicit_k5_matches_reference(65536, 1);
     }
 
     // ── Correctness: accumulation (calling twice doubles) ───────────
@@ -1573,9 +1687,97 @@ mod test {
             );
         }
 
+        #[cfg(not(feature = "rayon"))]
+        fn assert_avx512_k5_matches_reference(a_elems: usize, b_cols: usize) {
+            let params = test_params();
+            const K: usize = 5;
+
+            let a = random_bounded_aligned(K * a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_ref = vec![0u64; K * b_cols];
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_avx = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_explicit_avx512::<K, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(
+                c_avx.as_slice(),
+                c_ref.as_slice(),
+                "AVX-512 K=5 mismatch (a_elems={a_elems}, b_cols={b_cols})"
+            );
+        }
+
         #[test]
         fn test_avx512_standard() {
             assert_avx512_matches_reference(65536, 1024);
+        }
+
+        #[cfg(not(feature = "rayon"))]
+        #[test]
+        fn test_avx512_k5_matches_reference() {
+            assert_avx512_k5_matches_reference(65536, 1024);
+        }
+
+        #[cfg(not(feature = "rayon"))]
+        #[test]
+        fn test_avx512_k5_modulus_boundary() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 32;
+            const K: usize = 5;
+
+            let mut a = AlignedMemory64::new(K * a_elems);
+            for i in 0..K * a_elems {
+                a[i] = params.modulus - 1;
+            }
+            let b_t_u16: Vec<u16> = vec![u16::MAX; a_elems * b_cols];
+
+            let mut c_ref = vec![0u64; K * b_cols];
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_avx = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_explicit_avx512::<K, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(c_avx.as_slice(), c_ref.as_slice());
+        }
+
+        #[cfg(not(feature = "rayon"))]
+        #[test]
+        fn test_avx512_k5_single_column() {
+            assert_avx512_k5_matches_reference(65536, 1);
         }
 
         /// Exercises the inner loop with a single output column.  On the
