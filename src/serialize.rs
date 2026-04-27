@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader, Read, Seek, Write},
+    io::{self, BufReader, Read, Seek, Write},
 };
 
 use spiral_rs::{aligned_memory::AlignedMemory64, params::*, poly::*, util::read_arbitrary_bits};
@@ -8,6 +8,762 @@ use spiral_rs::{aligned_memory::AlignedMemory64, params::*, poly::*, util::read_
 use crate::client::{YPIRQuery, YPIRSimpleQuery};
 
 pub type Precomp<'a> = Vec<(PolyMatrixNTT<'a>, Vec<PolyMatrixNTT<'a>>, Vec<Vec<usize>>)>;
+
+// ── Cache I/O (warm-restart precompute cache) ────────────────────────────────
+//
+// Checked binary dump/load for `OfflinePrecomputedValues` and (in `server.rs`)
+// `YServer<u16>`. Unlike the existing `ToBytes`/`FromBytesParams` helpers
+// above (which use unchecked slicing safe only for trusted in-process bytes),
+// this API is contractually safe for disk-loaded input that may be truncated,
+// partially overwritten, or corrupted. The reader bounds-checks every access
+// and returns a typed `CacheError` instead of panicking.
+//
+// Format conventions:
+//   - all integers LE
+//   - all variable-length sections preceded by `u64 LE` length
+//   - `usize` is never serialized; converted to/from `u64 LE`
+//   - binary-stable within a major version; bumping `valar-ypir`'s major
+//     version may change the layout
+//
+// This API is for warm-restart caching only. It is not intended for cross-
+// process or network transfer; the cache is tied to specific build flags
+// (CPU features) and YPIR `Params`. The consumer is expected to wrap the
+// payload in its own header containing those identity fields.
+
+/// Errors returned by `OfflinePrecomputedValues::load_from` /
+/// `YServer::load_from`. `Io` wraps unexpected I/O errors; `Truncated` and
+/// `Malformed` indicate the cache file itself is unusable.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub enum CacheError {
+    /// Reader returned EOF before the expected number of bytes had been read,
+    /// or a length prefix would require more bytes than the source can supply.
+    Truncated {
+        what: &'static str,
+        needed: usize,
+        got: usize,
+    },
+    /// A field violated an internal invariant (e.g. dimensions inconsistent
+    /// with `Params`, `usize` value out of range, unknown payload version).
+    Malformed { what: &'static str, detail: String },
+    /// Underlying reader error (not EOF).
+    Io(io::Error),
+}
+
+#[cfg(feature = "server")]
+impl std::fmt::Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheError::Truncated { what, needed, got } => {
+                write!(f, "cache truncated: {what} needed {needed} bytes, got {got}")
+            }
+            CacheError::Malformed { what, detail } => {
+                write!(f, "cache malformed: {what}: {detail}")
+            }
+            CacheError::Io(e) => write!(f, "cache I/O error: {e}"),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::error::Error for CacheError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CacheError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<io::Error> for CacheError {
+    fn from(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            CacheError::Truncated { what: "reader", needed: 0, got: 0 }
+        } else {
+            CacheError::Io(e)
+        }
+    }
+}
+
+/// Payload format version embedded in the dump. Bump on any change that
+/// breaks cache validity, including:
+///   - Wire-format changes (added/removed/reordered fields, new encoding)
+///   - Algorithm changes that produce different bytes for the same input
+///     (e.g., RNG seeding, polynomial precomputation order) without changing
+///     the wire format
+///
+/// The loader rejects unknown values, so consumers don't need to track the
+/// crate version separately. If the dump bytes for the same input change in
+/// any way, bump this. The loader rejects unknown values.
+#[cfg(feature = "server")]
+const PAYLOAD_FORMAT_V1: u8 = 1;
+
+// The cache I/O bulk readers and writers reinterpret `&[u64]` as `&[u8]` via
+// raw pointer cast (see `write_u64_slice` / `read_u64_slice` below) for the
+// multi-GB `db_buf_aligned` and `hint_0` transfers. The on-wire format is
+// documented as little-endian; on a big-endian target the in-memory bytes
+// would not match, so the dump bytes would silently disagree with the docs.
+// Hard-fail at compile time rather than ship a silently-broken format. If
+// big-endian support is ever needed, replace the bulk transmute with an
+// explicit byteswap loop and remove this guard.
+#[cfg(all(feature = "server", not(target_endian = "little")))]
+compile_error!(
+    "valar-ypir cache I/O assumes a little-endian target. Build on x86_64, \
+     aarch64, or another LE target."
+);
+
+#[cfg(feature = "server")]
+pub(crate) mod cache_io {
+    use super::*;
+
+    pub(crate) fn write_u8<W: Write>(w: &mut W, v: u8) -> io::Result<()> {
+        w.write_all(&[v])
+    }
+
+    pub(crate) fn write_u32_le<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
+        w.write_all(&v.to_le_bytes())
+    }
+
+    pub(crate) fn write_u64_le<W: Write>(w: &mut W, v: u64) -> io::Result<()> {
+        w.write_all(&v.to_le_bytes())
+    }
+
+    pub(crate) fn read_u8<R: Read>(r: &mut R, what: &'static str) -> Result<u8, CacheError> {
+        let mut buf = [0u8; 1];
+        read_exact(r, &mut buf, what)?;
+        Ok(buf[0])
+    }
+
+    pub(crate) fn read_u32_le<R: Read>(r: &mut R, what: &'static str) -> Result<u32, CacheError> {
+        let mut buf = [0u8; 4];
+        read_exact(r, &mut buf, what)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    pub(crate) fn read_u64_le<R: Read>(r: &mut R, what: &'static str) -> Result<u64, CacheError> {
+        let mut buf = [0u8; 8];
+        read_exact(r, &mut buf, what)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    pub(super) fn read_exact<R: Read>(
+        r: &mut R,
+        buf: &mut [u8],
+        what: &'static str,
+    ) -> Result<(), CacheError> {
+        match r.read_exact(buf) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(CacheError::Truncated {
+                what,
+                needed: buf.len(),
+                got: 0,
+            }),
+            Err(e) => Err(CacheError::Io(e)),
+        }
+    }
+
+    /// Sanity ceiling on any length prefix. ~2 G elements; well above the
+    /// largest legitimate `db_buf_aligned` (a few hundred million `u64`s) and
+    /// any `Vec<PolyMatrixNTT>` count, but small enough that a corrupted
+    /// length byte can't trigger an unbounded allocation that OOMs the
+    /// process before we get a chance to return `CacheError`.
+    pub(crate) const MAX_LEN_PREFIX: u64 = 1 << 31;
+
+    /// Convert `u64 LE` length to `usize`, rejecting values that exceed
+    /// [`MAX_LEN_PREFIX`] or `usize::MAX`. Catches corrupted length bytes
+    /// that would otherwise OOM the process.
+    pub(crate) fn u64_to_usize(v: u64, what: &'static str) -> Result<usize, CacheError> {
+        if v > MAX_LEN_PREFIX {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!(
+                    "length {v} exceeds sanity ceiling {MAX_LEN_PREFIX} (likely corrupted)"
+                ),
+            });
+        }
+        usize::try_from(v).map_err(|_| CacheError::Malformed {
+            what,
+            detail: format!("length {v} exceeds usize::MAX"),
+        })
+    }
+
+    /// Bulk write a `&[u64]` as raw LE bytes (one `write_all` call instead of
+    /// `len` separate calls). On a little-endian target the in-memory layout
+    /// is already the on-wire layout, so this is a single memcpy. Per-u64
+    /// streaming would be ~5-10x slower for the multi-GB AlignedMemory64
+    /// dumps. The consumer's `target_hash` rejects caches loaded on a
+    /// big-endian host.
+    fn write_u64_slice<W: Write>(w: &mut W, s: &[u64]) -> io::Result<()> {
+        // SAFETY: u64 is a plain integer type with no padding; reinterpreting
+        // its byte representation is well-defined. Length is exact.
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 8) };
+        w.write_all(bytes)
+    }
+
+    /// Bulk read u64 LE bytes into the destination slice (one `read_exact`
+    /// call instead of `len` separate calls). Same LE-target rationale as
+    /// [`write_u64_slice`].
+    fn read_u64_slice<R: Read>(
+        r: &mut R,
+        dst: &mut [u64],
+        what: &'static str,
+    ) -> Result<(), CacheError> {
+        // SAFETY: as in write_u64_slice.
+        let dst_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 8)
+        };
+        match r.read_exact(dst_bytes) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(CacheError::Truncated {
+                what,
+                needed: dst_bytes.len(),
+                got: 0,
+            }),
+            Err(e) => Err(CacheError::Io(e)),
+        }
+    }
+
+    pub(super) fn dump_vec_u64<W: Write>(w: &mut W, v: &[u64]) -> io::Result<()> {
+        write_u64_le(w, v.len() as u64)?;
+        write_u64_slice(w, v)
+    }
+
+    /// Read a `Vec<u64>` whose length must match `expected_len`. Validates
+    /// the on-disk length prefix BEFORE allocating, so a corrupted length
+    /// like `1 << 30` can't trigger a multi-GB allocation before being
+    /// rejected. Use this whenever the expected length is derivable from
+    /// `params` (e.g. `hint_0` size); use [`load_vec_u64_capped`] only for
+    /// fields whose length truly varies.
+    pub(super) fn load_vec_u64_exact<R: Read>(
+        r: &mut R,
+        expected_len: usize,
+        what: &'static str,
+    ) -> Result<Vec<u64>, CacheError> {
+        let on_disk = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk != expected_len {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!("length {on_disk} != expected {expected_len}"),
+            });
+        }
+        let mut out = vec![0u64; expected_len];
+        read_u64_slice(r, &mut out, what)?;
+        Ok(out)
+    }
+
+    pub(crate) fn dump_aligned_memory64<W: Write>(
+        w: &mut W,
+        m: &AlignedMemory64,
+    ) -> io::Result<()> {
+        let slice: &[u64] = m.as_slice();
+        write_u64_le(w, slice.len() as u64)?;
+        write_u64_slice(w, slice)
+    }
+
+    /// Read an `AlignedMemory64` whose length must match `expected_len_u64`.
+    /// Validates the on-disk length prefix BEFORE allocating, so a corrupted
+    /// length can't trigger a multi-GB allocation before being rejected.
+    pub(crate) fn load_aligned_memory64_exact<R: Read>(
+        r: &mut R,
+        expected_len_u64: usize,
+        what: &'static str,
+    ) -> Result<AlignedMemory64, CacheError> {
+        let on_disk = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk != expected_len_u64 {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!(
+                    "length {on_disk} u64s != expected {expected_len_u64} u64s"
+                ),
+            });
+        }
+        let mut out = AlignedMemory64::new(expected_len_u64);
+        read_u64_slice(r, out.as_mut_slice(), what)?;
+        Ok(out)
+    }
+
+    pub(super) fn dump_poly_matrix_ntt<W: Write>(
+        w: &mut W,
+        m: &PolyMatrixNTT,
+    ) -> io::Result<()> {
+        write_u32_le(w, m.rows as u32)?;
+        write_u32_le(w, m.cols as u32)?;
+        write_u64_slice(w, m.as_slice())
+    }
+
+    /// Read a `PolyMatrixNTT` whose dimensions must match
+    /// `(expected_rows, expected_cols)`. Validates the on-disk dim prefix
+    /// BEFORE allocating, so a corrupted rows or cols can't multiply
+    /// through to a multi-GB allocation before being rejected. All current
+    /// SimplePIR consumers use this; the `MAX_LEN_PREFIX` cap is no longer
+    /// the load-bearing protection for any matrix in the cache format.
+    pub(super) fn load_poly_matrix_ntt_exact<'a, R: Read>(
+        r: &mut R,
+        params: &'a Params,
+        expected_rows: usize,
+        expected_cols: usize,
+        what: &'static str,
+    ) -> Result<PolyMatrixNTT<'a>, CacheError> {
+        let rows = u64_to_usize(read_u32_le(r, what)? as u64, what)?;
+        let cols = u64_to_usize(read_u32_le(r, what)? as u64, what)?;
+        if rows != expected_rows || cols != expected_cols {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!(
+                    "matrix dims {rows}x{cols} != expected {expected_rows}x{expected_cols}"
+                ),
+            });
+        }
+        let mut out = PolyMatrixNTT::zero(params, expected_rows, expected_cols);
+        read_u64_slice(r, out.as_mut_slice(), what)?;
+        Ok(out)
+    }
+
+    pub(super) fn dump_vec_pmntt<W: Write>(
+        w: &mut W,
+        v: &[PolyMatrixNTT],
+    ) -> io::Result<()> {
+        write_u64_le(w, v.len() as u64)?;
+        for m in v {
+            dump_poly_matrix_ntt(w, m)?;
+        }
+        Ok(())
+    }
+
+    /// Read a `Vec<PolyMatrixNTT>` whose outer length and per-matrix dims
+    /// must all match the expected values. Validates outer count BEFORE
+    /// `Vec::with_capacity`, then validates each matrix's dims BEFORE
+    /// `PolyMatrixNTT::zero`. Use this whenever both outer count and matrix
+    /// shape are derivable from `params`.
+    pub(super) fn load_vec_pmntt_exact<'a, R: Read>(
+        r: &mut R,
+        params: &'a Params,
+        expected_outer: usize,
+        expected_rows: usize,
+        expected_cols: usize,
+        what: &'static str,
+    ) -> Result<Vec<PolyMatrixNTT<'a>>, CacheError> {
+        let on_disk = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk != expected_outer {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!("outer length {on_disk} != expected {expected_outer}"),
+            });
+        }
+        let mut out = Vec::with_capacity(expected_outer);
+        for _ in 0..expected_outer {
+            out.push(load_poly_matrix_ntt_exact(
+                r,
+                params,
+                expected_rows,
+                expected_cols,
+                what,
+            )?);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn dump_vec_vec_pmntt<W: Write>(
+        w: &mut W,
+        v: &[Vec<PolyMatrixNTT>],
+    ) -> io::Result<()> {
+        write_u64_le(w, v.len() as u64)?;
+        for inner in v {
+            dump_vec_pmntt(w, inner)?;
+        }
+        Ok(())
+    }
+
+    /// Read a `Vec<Vec<PolyMatrixNTT>>` where outer count, inner count, and
+    /// per-matrix dims are all known up front and validated BEFORE any
+    /// allocation. Used by `prepacked_lwe`, whose shape (per-tracing of
+    /// `prep_pack_many_lwes` / `prep_pack_lwes` for SimplePIR) is fully
+    /// deterministic from `params`.
+    pub(super) fn load_vec_vec_pmntt_exact<'a, R: Read>(
+        r: &mut R,
+        params: &'a Params,
+        expected_outer: usize,
+        expected_inner: usize,
+        expected_rows: usize,
+        expected_cols: usize,
+        what: &'static str,
+    ) -> Result<Vec<Vec<PolyMatrixNTT<'a>>>, CacheError> {
+        let on_disk_outer = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk_outer != expected_outer {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!(
+                    "outer length {on_disk_outer} != expected {expected_outer}"
+                ),
+            });
+        }
+        let mut out = Vec::with_capacity(expected_outer);
+        for _ in 0..expected_outer {
+            let on_disk_inner = u64_to_usize(read_u64_le(r, what)?, what)?;
+            if on_disk_inner != expected_inner {
+                return Err(CacheError::Malformed {
+                    what,
+                    detail: format!(
+                        "inner length {on_disk_inner} != expected {expected_inner}"
+                    ),
+                });
+            }
+            let mut inner = Vec::with_capacity(expected_inner);
+            for _ in 0..expected_inner {
+                inner.push(load_poly_matrix_ntt_exact(
+                    r,
+                    params,
+                    expected_rows,
+                    expected_cols,
+                    what,
+                )?);
+            }
+            out.push(inner);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn dump_vec_usize<W: Write>(w: &mut W, v: &[usize]) -> io::Result<()> {
+        write_u64_le(w, v.len() as u64)?;
+        for &x in v {
+            write_u64_le(w, x as u64)?;
+        }
+        Ok(())
+    }
+
+    /// Read a `Vec<usize>` of exact length, validated BEFORE allocation.
+    pub(super) fn load_vec_usize_exact<R: Read>(
+        r: &mut R,
+        expected_len: usize,
+        what: &'static str,
+    ) -> Result<Vec<usize>, CacheError> {
+        let on_disk = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk != expected_len {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!("length {on_disk} != expected {expected_len}"),
+            });
+        }
+        let mut out = Vec::with_capacity(expected_len);
+        for _ in 0..expected_len {
+            out.push(u64_to_usize(read_u64_le(r, what)?, what)?);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn dump_vec_vec_usize<W: Write>(
+        w: &mut W,
+        v: &[Vec<usize>],
+    ) -> io::Result<()> {
+        write_u64_le(w, v.len() as u64)?;
+        for inner in v {
+            dump_vec_usize(w, inner)?;
+        }
+        Ok(())
+    }
+
+    /// Read a `Vec<Vec<usize>>` with exact outer and inner lengths, both
+    /// validated BEFORE allocation.
+    pub(super) fn load_vec_vec_usize_exact<R: Read>(
+        r: &mut R,
+        expected_outer: usize,
+        expected_inner: usize,
+        what: &'static str,
+    ) -> Result<Vec<Vec<usize>>, CacheError> {
+        let on_disk_outer = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk_outer != expected_outer {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!(
+                    "outer length {on_disk_outer} != expected {expected_outer}"
+                ),
+            });
+        }
+        let mut out = Vec::with_capacity(expected_outer);
+        for _ in 0..expected_outer {
+            out.push(load_vec_usize_exact(r, expected_inner, what)?);
+        }
+        Ok(out)
+    }
+
+    pub(super) fn dump_precomp<W: Write>(w: &mut W, p: &Precomp) -> io::Result<()> {
+        write_u64_le(w, p.len() as u64)?;
+        for (m, vm, vvu) in p {
+            dump_poly_matrix_ntt(w, m)?;
+            dump_vec_pmntt(w, vm)?;
+            dump_vec_vec_usize(w, vvu)?;
+        }
+        Ok(())
+    }
+
+    /// Expected per-tuple shape inside `Precomp` for SimplePIR. Per
+    /// tracing of `precompute_pack`:
+    /// - `m`: `working_set[0].clone()`, shape `2x1`
+    /// - `vm`: built up by `res.push(condense_matrix(.., t_exp_left × 1))`,
+    ///   total length = `poly_len - 1` (sum of `1 << (ell - cur_ell)` over
+    ///   `cur_ell ∈ 1..=ell` where `ell = poly_len_log2`)
+    /// - `vvu`: `generate_automorph_tables_brute_force(params)`, outer
+    ///   length `poly_len_log2`, inner length `poly_len`
+    pub(super) struct PrecompShape {
+        pub outer: usize,
+        pub m_rows: usize,
+        pub m_cols: usize,
+        pub vm_len: usize,
+        pub vm_rows: usize,
+        pub vm_cols: usize,
+        pub vvu_outer: usize,
+        pub vvu_inner: usize,
+    }
+
+    /// Read a `Precomp` whose every shape is known up front and validated
+    /// BEFORE any allocation. Replaces the previous `_outer_exact` variant
+    /// that accepted `MAX_LEN_PREFIX`-bounded inner allocations.
+    pub(super) fn load_precomp_exact<'a, R: Read>(
+        r: &mut R,
+        params: &'a Params,
+        shape: &PrecompShape,
+        what: &'static str,
+    ) -> Result<Precomp<'a>, CacheError> {
+        let on_disk = u64_to_usize(read_u64_le(r, what)?, what)?;
+        if on_disk != shape.outer {
+            return Err(CacheError::Malformed {
+                what,
+                detail: format!("outer length {on_disk} != expected {}", shape.outer),
+            });
+        }
+        let mut out = Vec::with_capacity(shape.outer);
+        for _ in 0..shape.outer {
+            let m =
+                load_poly_matrix_ntt_exact(r, params, shape.m_rows, shape.m_cols, what)?;
+            let on_disk_vm = u64_to_usize(read_u64_le(r, what)?, what)?;
+            if on_disk_vm != shape.vm_len {
+                return Err(CacheError::Malformed {
+                    what,
+                    detail: format!(
+                        "vm length {on_disk_vm} != expected {}",
+                        shape.vm_len
+                    ),
+                });
+            }
+            let mut vm = Vec::with_capacity(shape.vm_len);
+            for _ in 0..shape.vm_len {
+                vm.push(load_poly_matrix_ntt_exact(
+                    r,
+                    params,
+                    shape.vm_rows,
+                    shape.vm_cols,
+                    what,
+                )?);
+            }
+            let vvu = load_vec_vec_usize_exact(r, shape.vvu_outer, shape.vvu_inner, what)?;
+            out.push((m, vm, vvu));
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "server")]
+impl<'a> OfflinePrecomputedValues<'a> {
+    /// Dump the precomputed values to a writer in a checked binary format.
+    /// Format is binary-stable within a major version of `valar-ypir`.
+    /// Intended for warm-restart caching only; see module docs for caveats.
+    ///
+    /// **Endianness:** the on-wire format is little-endian. The bulk
+    /// `&[u64]` writes inside the cache I/O helpers reinterpret memory as
+    /// raw bytes for performance, so this code only compiles on
+    /// little-endian targets (enforced by a `compile_error!` at the top of
+    /// the cache I/O module).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if the writer fails. Panics if
+    /// `smaller_server` is `Some(_)` (this dump is for SimplePIR servers,
+    /// where `smaller_server` is always `None`).
+    pub fn dump_into<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        assert!(
+            self.smaller_server.is_none(),
+            "dump_into requires smaller_server to be None (SimplePIR)"
+        );
+
+        cache_io::write_u8(w, PAYLOAD_FORMAT_V1)?;
+        // flags reserved for future use; bit 0 = smaller_server present
+        cache_io::write_u8(w, 0)?;
+
+        cache_io::dump_vec_u64(w, &self.hint_0)?;
+        cache_io::dump_vec_u64(w, &self.hint_1)?;
+        cache_io::dump_vec_pmntt(w, &self.pseudorandom_query_1)?;
+        cache_io::dump_vec_pmntt(w, &self.y_constants.0)?;
+        cache_io::dump_vec_pmntt(w, &self.y_constants.1)?;
+        cache_io::dump_vec_vec_pmntt(w, &self.prepacked_lwe)?;
+        cache_io::dump_vec_pmntt(w, &self.fake_pack_pub_params)?;
+        cache_io::dump_precomp(w, &self.precomp)?;
+        Ok(())
+    }
+
+    /// Load precomputed values from a reader. Bounds-checks every access;
+    /// returns `CacheError` on truncation, malformed data, or version
+    /// mismatch. Never panics on disk-derived input.
+    ///
+    /// `params` must match the params the cache was originally produced with;
+    /// the consumer is responsible for verifying that via its own header
+    /// (typically a hash of the relevant `Params` fields).
+    ///
+    /// **Trailing-byte contract:** this method consumes exactly the bytes
+    /// produced by one call to [`Self::dump_into`] and stops; it does NOT
+    /// check whether the reader has more bytes after that. Callers that want
+    /// "this file contains exactly one dump" semantics must perform their
+    /// own EOF check on the reader after this returns. (Within the consumer
+    /// repo this lets us chain `YServer::load_from` then
+    /// `OfflinePrecomputedValues::load_from` against a single cache file.)
+    ///
+    /// **Validation order:** length prefixes for every well-known field are
+    /// checked against the expected size derived from `params` BEFORE any
+    /// allocation. A corrupted length prefix can't trigger a multi-GB
+    /// allocation before being rejected.
+    pub fn load_from<R: Read>(
+        r: &mut R,
+        params: &'a Params,
+    ) -> Result<Self, CacheError> {
+        let v = cache_io::read_u8(r, "payload version")?;
+        if v != PAYLOAD_FORMAT_V1 {
+            return Err(CacheError::Malformed {
+                what: "payload version",
+                detail: format!("unknown version {v}, expected {PAYLOAD_FORMAT_V1}"),
+            });
+        }
+
+        // Known flag bits for PAYLOAD_FORMAT_V1:
+        //   bit 0: smaller_server-present (must be 0 — SimplePIR-only loader)
+        // Bits 1..=7 are reserved; reject if set, so a future format that
+        // assigns them isn't silently mis-loaded by older code.
+        const KNOWN_FLAGS: u8 = 0b0000_0001;
+        let flags = cache_io::read_u8(r, "flags")?;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(CacheError::Malformed {
+                what: "flags",
+                detail: format!(
+                    "unknown flag bits set: 0x{flags:02x} (known mask 0x{KNOWN_FLAGS:02x})"
+                ),
+            });
+        }
+        if flags & 0x01 != 0 {
+            return Err(CacheError::Malformed {
+                what: "flags",
+                detail: "smaller_server-present flag set; this loader expects None".to_string(),
+            });
+        }
+
+        // Expected SimplePIR shapes from
+        // `YServer::perform_offline_precomputation_simplepir`. If the upstream
+        // algorithm changes any of these (e.g. different num_rlwe_outputs
+        // calculation), bump PAYLOAD_FORMAT_V1 and update this map together.
+        let db_cols = params
+            .instances
+            .checked_mul(params.poly_len)
+            .ok_or(CacheError::Malformed {
+                what: "params",
+                detail: "instances * poly_len overflowed".to_string(),
+            })?;
+        let expected_hint_0_len = params
+            .poly_len
+            .checked_mul(db_cols)
+            .ok_or(CacheError::Malformed {
+                what: "params",
+                detail: "poly_len * db_cols overflowed".to_string(),
+            })?;
+        let num_rlwe_outputs = params.instances;
+
+        // Each `_exact` loader checks the on-disk length prefix against the
+        // expected value BEFORE allocating, so a corrupted length cannot
+        // trigger a multi-GB allocation.
+        let hint_0 = cache_io::load_vec_u64_exact(r, expected_hint_0_len, "hint_0")?;
+        let hint_1 = cache_io::load_vec_u64_exact(r, 0, "hint_1 (SimplePIR expects empty)")?;
+        let pseudorandom_query_1 = cache_io::load_vec_pmntt_exact(
+            r,
+            params,
+            0,
+            0,
+            0,
+            "pseudorandom_query_1 (SimplePIR expects empty)",
+        )?;
+        let y_constants_0 = cache_io::load_vec_pmntt_exact(
+            r,
+            params,
+            params.poly_len_log2,
+            1,
+            1,
+            "y_constants.0",
+        )?;
+        let y_constants_1 = cache_io::load_vec_pmntt_exact(
+            r,
+            params,
+            params.poly_len_log2,
+            1,
+            1,
+            "y_constants.1",
+        )?;
+        // prepacked_lwe shape (per-tracing of `prep_pack_many_lwes` /
+        // `prep_pack_lwes` in packing.rs for SimplePIR):
+        //   - outer length: num_rlwe_outputs (= params.instances)
+        //   - inner length: params.poly_len
+        //   - per matrix: 2 x 1 (PolyMatrixRaw::zero(params, 2, 1).ntt())
+        let prepacked_lwe = cache_io::load_vec_vec_pmntt_exact(
+            r,
+            params,
+            num_rlwe_outputs,
+            params.poly_len,
+            2,
+            1,
+            "prepacked_lwe",
+        )?;
+        let fake_pack_pub_params = cache_io::load_vec_pmntt_exact(
+            r,
+            params,
+            params.poly_len_log2,
+            2,
+            params.t_exp_left,
+            "fake_pack_pub_params",
+        )?;
+        // precomp shape (per-tracing of `precompute_pack` in packing.rs):
+        //   - outer length: num_rlwe_outputs
+        //   - per tuple:
+        //     - first PolyMatrixNTT: 2 x 1 (working_set[0].clone())
+        //     - second Vec<PolyMatrixNTT>:
+        //         length poly_len - 1 (sum of `1 << (ell - cur_ell)` over
+        //         cur_ell in 1..=poly_len_log2)
+        //         per matrix: t_exp_left x 1 (condense_matrix preserves
+        //         shape from PolyMatrixNTT::zero(params, t_exp_left, 1))
+        //     - third Vec<Vec<usize>> (automorph tables):
+        //         outer poly_len_log2, inner poly_len
+        let precomp_shape = cache_io::PrecompShape {
+            outer: num_rlwe_outputs,
+            m_rows: 2,
+            m_cols: 1,
+            vm_len: params.poly_len.checked_sub(1).ok_or(CacheError::Malformed {
+                what: "params",
+                detail: "poly_len < 1".to_string(),
+            })?,
+            vm_rows: params.t_exp_left,
+            vm_cols: 1,
+            vvu_outer: params.poly_len_log2,
+            vvu_inner: params.poly_len,
+        };
+        let precomp = cache_io::load_precomp_exact(r, params, &precomp_shape, "precomp")?;
+
+        Ok(OfflinePrecomputedValues {
+            hint_0,
+            hint_1,
+            pseudorandom_query_1,
+            y_constants: (y_constants_0, y_constants_1),
+            smaller_server: None,
+            prepacked_lwe,
+            fake_pack_pub_params,
+            precomp,
+        })
+    }
+}
 
 #[cfg(feature = "server")]
 use crate::server::YServer;
