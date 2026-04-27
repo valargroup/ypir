@@ -54,7 +54,7 @@ use rayon::prelude::*;
 #[derive(Copy, Clone)]
 struct SendPtr<T>(*const T);
 
-#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+#[cfg(feature = "rayon")]
 #[derive(Copy, Clone)]
 struct SendMutPtr<T>(*mut T);
 
@@ -63,9 +63,9 @@ unsafe impl<T> Send for SendPtr<T> {}
 #[cfg(feature = "rayon")]
 unsafe impl<T> Sync for SendPtr<T> {}
 
-#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+#[cfg(feature = "rayon")]
 unsafe impl<T> Send for SendMutPtr<T> {}
-#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+#[cfg(feature = "rayon")]
 unsafe impl<T> Sync for SendMutPtr<T> {}
 
 #[cfg(feature = "rayon")]
@@ -81,7 +81,7 @@ impl<T> SendPtr<T> {
     }
 }
 
-#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+#[cfg(feature = "rayon")]
 impl<T> SendMutPtr<T> {
     /// Extract the inner raw pointer. See `SendPtr::get` for why this takes
     /// `self` by value.
@@ -416,8 +416,6 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
     *const T: ToM512 + ToU64,
 {
     assert_eq!(a_elems, b_rows);
-    #[cfg(feature = "rayon")]
-    assert_eq!(K, 1);
 
     let simd_width = 1; // scalar: one element per iteration
 
@@ -428,8 +426,8 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
 
     // ── Rayon parallel path (scalar / implicit) ────────────────────────
     //
-    // Identical column-parallel strategy as the AVX-512 rayon path above,
-    // but using scalar arithmetic instead of 512-bit SIMD intrinsics.
+    // Identical column-partitioned / batch-broadcast strategy as the AVX-512
+    // rayon path above, but using scalar arithmetic instead of SIMD.
     //
     // Each element is split into its low and high 32-bit halves so that
     // the u64 multiplication  a[k] * b[k]  is decomposed as:
@@ -439,72 +437,62 @@ pub fn fast_batched_dot_product_implicit<const K: usize, T: Copy>(
     // modulus is a product of two ~32-bit primes.  After accumulation,
     // Barrett reduction + CRT recomposition recovers the result mod q.
     //
-    // Also K=1-only, and for the same two reasons as the AVX-512 block:
-    // (1) `par_chunks_mut` on the flat `c` buffer only produces valid
-    // single-batch column ranges when K=1 (for K>1, chunks straddle the
-    // batch-row boundaries of the K*b_cols layout), and (2) the writeback
-    // only reads `total_sum_*[0]`, silently discarding batches ≥ 1.
-    // Hence the unconditional `assert_eq!(K, 1)` at the top of this fn.
-    // Generalizing is tracked in ZCA-256
-    // (https://linear.app/zcale/issue/ZCA-256), sub-issue of ZCA-239.
-    //
     // Safety / threading notes are the same as the AVX-512 rayon block.
     #[cfg(feature = "rayon")]
     {
         let b_send = SendPtr(b_t.as_ptr());
         let a_send = SendPtr(a.as_ptr());
+        let c_send = SendMutPtr(c.as_mut_ptr());
         let a_len = a.len();
         let num_threads = rayon::current_num_threads();
         // See the matching comment in the AVX-512 path above for why
         // `.max(1)` is needed.
         let cols_per_chunk = ((b_cols + num_threads - 1) / num_threads).max(1);
 
-        // `move` + `SendPtr::get()`: see matching comment in the AVX-512
-        // path for why we can't access `.0` directly here.
-        c.par_chunks_mut(cols_per_chunk)
-            .enumerate()
-            .for_each(move |(chunk_idx, c_chunk)| {
-                let j_start = chunk_idx * cols_per_chunk;
-                unsafe {
-                    let b_ptr = b_send.get();
-                    let a_slice = std::slice::from_raw_parts(a_send.get(), a_len);
-                    let a_slcs = split_a::<K>(a_slice);
+        (0..num_threads).into_par_iter().for_each(move |chunk_idx| {
+            let j_start = chunk_idx * cols_per_chunk;
+            let j_end = (j_start + cols_per_chunk).min(b_cols);
 
-                    for k_outer in 0..num_chunks {
-                        for (j_local, c_cell) in c_chunk.iter_mut().enumerate() {
-                            let j = j_start + j_local;
-                            debug_assert!(
-                                j < b_cols,
-                                "par_chunks_mut partition invariant broken: j={j} >= b_cols={b_cols}"
-                            );
+            unsafe {
+                let b_ptr = b_send.get();
+                let c_ptr = c_send.get();
+                let a_slice = std::slice::from_raw_parts(a_send.get(), a_len);
+                let a_slcs = split_a::<K>(a_slice);
 
-                            let mut total_sum_lo = [0u64; K];
-                            let mut total_sum_hi = [0u64; K];
-                            let mut tmp = [0u64; K];
+                for k_outer in 0..num_chunks {
+                    for j in j_start..j_end {
+                        let mut total_sum_lo = [0u64; K];
+                        let mut total_sum_hi = [0u64; K];
+                        let mut tmp = [0u64; K];
 
-                            for k_inner in 0..chunk_size {
-                                let k = simd_width * (k_outer * chunk_size + k_inner);
-                                let b_val_simd = (b_ptr.add(j * b_rows + k)).to_u64();
+                        for k_inner in 0..chunk_size {
+                            let k = simd_width * (k_outer * chunk_size + k_inner);
+                            let b_val_simd = (b_ptr.add(j * b_rows + k)).to_u64();
 
-                                for batch in 0..K {
-                                    tmp[batch] = *(a_slcs[batch].as_ptr().add(k));
-                                }
-
-                                for batch in 0..K {
-                                    let a_val_lo = (tmp[batch] as u32) as u64;
-                                    let a_val_hi = ((tmp[batch] >> 32) as u32) as u64;
-                                    total_sum_lo[batch] += a_val_lo * b_val_simd;
-                                    total_sum_hi[batch] += a_val_hi * b_val_simd;
-                                }
+                            for batch in 0..K {
+                                tmp[batch] = *(a_slcs[batch].as_ptr().add(k));
                             }
 
-                            // K=1-only path: reduce and write back batch 0.
-                            // See the K=1 discussion comment above.
-                            writeback(params, c_cell, total_sum_lo[0], total_sum_hi[0]);
+                            for batch in 0..K {
+                                let a_val_lo = (tmp[batch] as u32) as u64;
+                                let a_val_hi = ((tmp[batch] >> 32) as u32) as u64;
+                                total_sum_lo[batch] += a_val_lo * b_val_simd;
+                                total_sum_hi[batch] += a_val_hi * b_val_simd;
+                            }
+                        }
+
+                        for batch in 0..K {
+                            writeback(
+                                params,
+                                &mut *c_ptr.add(batch * b_cols + j),
+                                total_sum_lo[batch],
+                                total_sum_hi[batch],
+                            );
                         }
                     }
                 }
-            });
+            }
+        });
         return;
     }
 
@@ -1217,9 +1205,68 @@ mod test {
             }
         }
 
+        fn assert_rayon_k5_matches_reference(a_elems: usize, b_cols: usize) {
+            let params = test_params();
+            const K: usize = 5;
+
+            let a = random_bounded_aligned(K * a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_ref = vec![0u64; K * b_cols];
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_rayon = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_implicit::<K, _>(
+                &params,
+                c_rayon.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(
+                c_rayon.as_slice(),
+                c_ref.as_slice(),
+                "rayon K=5 mismatch (a_elems={a_elems}, b_cols={b_cols})"
+            );
+        }
+
         #[test]
         fn test_rayon_implicit_standard() {
             assert_rayon_matches_reference(65536, 1024);
+        }
+
+        #[test]
+        fn test_rayon_implicit_k5_matches_reference() {
+            assert_rayon_k5_matches_reference(65536, 1024);
+        }
+
+        #[test]
+        fn test_rayon_implicit_k5_non_power_of_two_cols() {
+            assert_rayon_k5_matches_reference(65536, 100);
+        }
+
+        #[test]
+        fn test_rayon_implicit_k5_single_column() {
+            assert_rayon_k5_matches_reference(65536, 1);
+        }
+
+        #[test]
+        fn test_rayon_implicit_k5_cols_less_than_threads() {
+            let num_threads = rayon::current_num_threads();
+            if num_threads > 3 {
+                assert_rayon_k5_matches_reference(65536, 3);
+            }
         }
 
         #[test]
@@ -1343,6 +1390,46 @@ mod test {
                     "rayon accumulation mismatch at column {j}"
                 );
             }
+        }
+
+        #[test]
+        fn test_rayon_implicit_k5_accumulates() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 100;
+            const K: usize = 5;
+
+            let a = random_bounded_aligned(K * a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_initial = vec![0u64; K * b_cols];
+            for i in 0..K * b_cols {
+                c_initial[i] = (i as u64 * 17) % params.modulus;
+            }
+            let mut c_ref = c_initial.clone();
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_rayon = AlignedMemory64::new(K * b_cols);
+            c_rayon.as_mut_slice().copy_from_slice(&c_initial);
+            fast_batched_dot_product_implicit::<K, _>(
+                &params,
+                c_rayon.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(c_rayon.as_slice(), c_ref.as_slice());
         }
 
         #[test]
@@ -1537,6 +1624,69 @@ mod test {
                 h.join().expect("concurrent kernel driver panicked");
             }
         }
+
+        #[test]
+        fn test_rayon_implicit_k5_concurrent_invocations() {
+            use std::sync::Arc;
+            use std::thread;
+
+            let params = Arc::new(test_params());
+            let a_elems = 65536;
+            let b_cols = 128;
+            const K: usize = 5;
+            let num_drivers = 4;
+
+            let inputs: Vec<_> = (0..num_drivers)
+                .map(|seed| {
+                    fastrand::seed(seed as u64);
+                    let a = random_bounded_aligned(K * a_elems, params.modulus);
+                    let b_t_u16 = random_u16_vec(a_elems * b_cols);
+                    let mut c_ref = vec![0u64; K * b_cols];
+                    reference_batched_dot_product_u16::<K>(
+                        &params,
+                        &mut c_ref,
+                        a.as_slice(),
+                        a_elems,
+                        &b_t_u16,
+                        a_elems,
+                        b_cols,
+                    );
+                    (a.as_slice().to_vec(), b_t_u16, c_ref)
+                })
+                .collect();
+
+            let handles: Vec<_> = inputs
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (a_vec, b_t_u16, c_ref))| {
+                    let params = Arc::clone(&params);
+                    thread::spawn(move || {
+                        let mut a = AlignedMemory64::new(a_vec.len());
+                        a.as_mut_slice().copy_from_slice(&a_vec);
+
+                        let mut c = AlignedMemory64::new(K * b_cols);
+                        fast_batched_dot_product_implicit::<K, _>(
+                            &params,
+                            c.as_mut_slice(),
+                            a.as_slice(),
+                            a_elems,
+                            &b_t_u16,
+                            a_elems,
+                            b_cols,
+                        );
+                        assert_eq!(
+                            c.as_slice(),
+                            c_ref.as_slice(),
+                            "driver {idx}: K=5 concurrent mismatch"
+                        );
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().expect("concurrent K=5 kernel driver panicked");
+            }
+        }
     }
 
     // ── AVX-512 tests: hand-written intrinsics must match reference ──
@@ -1725,6 +1875,59 @@ mod test {
             );
         }
 
+        #[cfg(feature = "rayon")]
+        fn assert_avx512_rayon_k5_matches_implicit(a_elems: usize, b_cols: usize) {
+            let params = test_params();
+            const K: usize = 5;
+
+            let a = random_bounded_aligned(K * a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_ref = vec![0u64; K * b_cols];
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_scalar = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_implicit::<K, _>(
+                &params,
+                c_scalar.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_avx = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_explicit_avx512::<K, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(
+                c_scalar.as_slice(),
+                c_ref.as_slice(),
+                "rayon scalar K=5 mismatch (a_elems={a_elems}, b_cols={b_cols})"
+            );
+            assert_eq!(
+                c_avx.as_slice(),
+                c_scalar.as_slice(),
+                "rayon AVX-512 and scalar K=5 disagree (a_elems={a_elems}, b_cols={b_cols})"
+            );
+        }
+
         #[test]
         fn test_avx512_standard() {
             assert_avx512_matches_reference(65536, 1024);
@@ -1734,6 +1937,12 @@ mod test {
         #[test]
         fn test_avx512_rayon_k5_matches_reference() {
             assert_avx512_rayon_k5_matches_reference(65536, 1024);
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn test_rayon_avx512_k5_matches_implicit() {
+            assert_avx512_rayon_k5_matches_implicit(65536, 1024);
         }
 
         #[cfg(feature = "rayon")]
