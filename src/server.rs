@@ -1330,6 +1330,8 @@ where
 
 #[cfg(test)]
 mod simplepir_batched_tests {
+    use crate::bits::u64s_to_contiguous_bytes;
+
     use super::*;
 
     const K: usize = 5;
@@ -1379,6 +1381,52 @@ mod simplepir_batched_tests {
             assert_eq!(
                 batched[slot], sequential[slot],
                 "batched SimplePIR response diverged from sequential response at slot {slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn simplepir_batched_k5_responses_decode_to_requested_rows() {
+        let params = params_for_scenario_simplepir(1 << 11, 2048 * 14);
+        let client = YPIRClient::new(&params);
+        let db_rows = params.db_rows();
+        let db_cols = params.db_cols_simplepir();
+        let db = (0..db_rows * db_cols)
+            .map(|idx| ((idx * 37 + 11) as u64 % params.pt_modulus) as u16)
+            .collect::<Vec<_>>();
+
+        let server = YServer::<u16>::new(&params, db.iter().copied(), true, false, false);
+        let offline_vals = server.perform_offline_precomputation_simplepir(None, None, None);
+
+        let target_rows = [0usize, 1, db_rows / 3, db_rows / 2, db_rows - 1];
+        let queries = target_rows.map(|target_row| client.generate_query_simplepir(target_row));
+
+        let mut batched_first_dim = Vec::with_capacity(K * params.db_rows_padded_simplepir());
+        for (query, _) in queries.iter() {
+            batched_first_dim.extend_from_slice(query.0.as_slice());
+        }
+        let pub_param_slices: [&[u64]; K] =
+            std::array::from_fn(|slot| queries[slot].0 .1.as_slice());
+
+        let batched = server.perform_online_computation_simplepir_batched::<K>(
+            &batched_first_dim,
+            &offline_vals,
+            &pub_param_slices,
+            None,
+        );
+
+        for slot in 0..K {
+            let target_row = target_rows[slot];
+            let decoded = client.decode_response_simplepir(queries[slot].1, &batched[slot]);
+            let expected_row = db[target_row * db_cols..(target_row + 1) * db_cols]
+                .iter()
+                .map(|&value| value as u64)
+                .collect::<Vec<_>>();
+            let expected = u64s_to_contiguous_bytes(&expected_row, params.pt_modulus_bits());
+
+            assert_eq!(
+                decoded, expected,
+                "batched SimplePIR decoded row diverged from DB row at slot {slot}"
             );
         }
     }
