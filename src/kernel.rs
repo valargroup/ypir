@@ -54,10 +54,19 @@ use rayon::prelude::*;
 #[derive(Copy, Clone)]
 struct SendPtr<T>(*const T);
 
+#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+#[derive(Copy, Clone)]
+struct SendMutPtr<T>(*mut T);
+
 #[cfg(feature = "rayon")]
 unsafe impl<T> Send for SendPtr<T> {}
 #[cfg(feature = "rayon")]
 unsafe impl<T> Sync for SendPtr<T> {}
+
+#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+unsafe impl<T> Send for SendMutPtr<T> {}
+#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+unsafe impl<T> Sync for SendMutPtr<T> {}
 
 #[cfg(feature = "rayon")]
 impl<T> SendPtr<T> {
@@ -68,6 +77,16 @@ impl<T> SendPtr<T> {
     /// which is `!Sync`, defeating the whole point of the newtype.
     #[inline(always)]
     fn get(self) -> *const T {
+        self.0
+    }
+}
+
+#[cfg(all(feature = "rayon", feature = "explicit_avx512"))]
+impl<T> SendMutPtr<T> {
+    /// Extract the inner raw pointer. See `SendPtr::get` for why this takes
+    /// `self` by value.
+    #[inline(always)]
+    fn get(self) -> *mut T {
         self.0
     }
 }
@@ -254,147 +273,92 @@ pub fn fast_batched_dot_product_explicit_avx512<const K: usize, T: Copy>(
 
     // ── Rayon parallel path (AVX-512) ──────────────────────────────────
     //
-    // The matrix-vector product  c = a · B^T  iterates over b_cols output
-    // columns.  Each column j produces an independent dot product:
-    //   c[j] = Σ_k  a[k] * b_t[j * b_rows + k]
-    //
-    // Because columns are independent, we can split them across threads
-    // with zero synchronization.  `par_chunks_mut` gives each rayon thread
-    // an exclusive &mut slice of the output buffer `c`, so no locks or
-    // atomics are needed.
-    //
-    // Restricted to K=1 (the only value used in SimplePIR's online phase).
-    // The limitation is in how `c` is partitioned across threads, not in
-    // the arithmetic — the non-rayon path below is already K-generic.
-    // Two concrete reasons today's code only works for K=1:
-    //
-    //   1. Output layout vs. `par_chunks_mut`.  `c` is a flat buffer of
-    //      length K*b_cols, laid out as K batch-rows concatenated:
-    //        [batch0_col0 .. batch0_col_{b_cols-1},
-    //         batch1_col0 .. batch1_col_{b_cols-1}, …]
-    //      For K=1, `c.len() == b_cols`, so `par_chunks_mut(cols_per_chunk)`
-    //      produces chunks that are exactly column ranges of the one
-    //      output row, and the inner `j = j_start + j_local` indexing
-    //      into `b_t[j * b_rows + k]` is correct.  For K>1, the flat
-    //      chunks can straddle the batch-row boundary (a chunk may end
-    //      inside batch 0 and continue into batch 1), so `j_local` no
-    //      longer maps 1-to-1 onto a single database column for a single
-    //      batch row.  A K-generic rayon path has to partition differently
-    //      (e.g. split `c` into K disjoint sub-slices per thread via raw
-    //      pointer math, mirroring the `a`/`b_t` address-by-usize trick
-    //      already used here).
-    //
-    //   2. Reduction hard-codes batch 0.  The inner loop computes
-    //      `total_sum_lo[K]` / `total_sum_hi[K]` correctly for every
-    //      batch, but the horizontal reduction and writeback below only
-    //      reads `total_sum_*[0]` and stores into `c_chunk[j_local]`.
-    //      Batches ≥ 1 are computed and silently discarded.  K-generic
-    //      support requires looping `for batch in 0..K` around the
-    //      reduction and writing to the per-batch output sub-slice.
-    //
-    // Design note: the right fix is column-partitioned / batch-broadcast
-    // (thread owns a column range, computes all K batches within it).
-    // This preserves the whole point of batching — `b_t` is streamed from
-    // DRAM once and reused K times in registers, so arithmetic intensity
-    // scales with K.  The naive alternative (partition threads by batch)
-    // would K× the DRAM traffic and cap parallelism at K.  Tracked in
-    // ZCA-256 (https://linear.app/zcale/issue/ZCA-256), sub-issue of
-    // ZCA-239 (PIR batch query).
+    // Column-partitioned / batch-broadcast: each worker owns a disjoint
+    // output-column range and computes all K batch rows for those columns.
+    // This preserves the batching win by streaming each `b_t` column once
+    // and reusing it across K query rows in registers.
     //
     // Safety of the pointer captures:
     //   - `a` and `b_t` are read-only for the entire duration of the
     //     parallel region; the caller holds &[u64] / &[T] borrows.
-    //   - Each thread writes only to its own `c_chunk` (disjoint slices).
-    //   - Raw pointers are wrapped in `SendPtr` (Copy + Send + Sync) so
-    //     the rayon closure can capture them while preserving provenance
-    //     (unlike the `as usize` / `as *const _` round-trip, which drops
-    //     it and breaks under strict-provenance rules / Miri).
-    //
-    // Edge cases:
-    //   - b_cols not divisible by num_threads: the last chunk produced by
-    //     `par_chunks_mut` is shorter; `j < b_cols` still holds because
-    //     `par_chunks_mut` never hands out indices past `c.len()`, which
-    //     equals `b_cols` for K=1.  A `debug_assert!` locks this in.
-    //   - b_cols < num_threads: some chunks are empty (par_chunks_mut
-    //     simply produces fewer chunks).
+    //   - Each thread writes only to `batch * b_cols + j` for its disjoint
+    //     `j` range, so output writes are disjoint across threads.
+    //   - Raw pointers are wrapped in `SendPtr` / `SendMutPtr` (Copy + Send
+    //     + Sync) so the rayon closure can capture them while preserving
+    //     provenance.
     #[cfg(feature = "rayon")]
-    if K == 1 {
+    {
         let b_send = SendPtr(b_t.as_ptr());
         let a_send = SendPtr(a.as_ptr());
+        let c_send = SendMutPtr(c.as_mut_ptr());
         let a_len = a.len();
         let num_threads = rayon::current_num_threads();
-        // `.max(1)` so `par_chunks_mut` never gets a zero chunk size — it
-        // panics on 0.  When b_cols == 0 the slice is empty, so any
-        // positive chunk size yields zero chunks and the closure is a
-        // no-op, which is the correct result.
+        // `.max(1)` keeps empty-column cases from producing a zero chunk
+        // size; empty ranges below simply do no work.
         let cols_per_chunk = ((b_cols + num_threads - 1) / num_threads).max(1);
 
-        // `move` plus the `SendPtr::get` accessor (taking `self` by
-        // value) forces RFC 2229 to capture the whole `SendPtr` — which
-        // is `Send + Sync` via its unsafe impl — rather than the inner
-        // `*const _` field in isolation, which is `!Send + !Sync` and
-        // would cause the closure to fail rayon's bounds.
-        c.par_chunks_mut(cols_per_chunk)
-            .enumerate()
-            .for_each(move |(chunk_idx, c_chunk)| {
-                let j_start = chunk_idx * cols_per_chunk;
-                unsafe {
-                    let b_ptr = b_send.get();
-                    let a_slice = std::slice::from_raw_parts(a_send.get(), a_len);
-                    let a_slcs = split_a::<K>(a_slice);
+        (0..num_threads).into_par_iter().for_each(move |chunk_idx| {
+            let j_start = chunk_idx * cols_per_chunk;
+            let j_end = (j_start + cols_per_chunk).min(b_cols);
 
-                    // Outer loop over row chunks (accumulation dimension).
-                    // Each k_outer processes `chunk_size` groups of 8 (simd_width)
-                    // elements, accumulating partial sums in AVX-512 registers.
-                    for k_outer in 0..num_chunks {
-                        for (j_local, c_cell) in c_chunk.iter_mut().enumerate() {
-                            let j = j_start + j_local;
-                            debug_assert!(
-                                j < b_cols,
-                                "par_chunks_mut partition invariant broken: j={j} >= b_cols={b_cols}"
-                            );
+            unsafe {
+                let b_ptr = b_send.get();
+                let c_ptr = c_send.get();
+                let a_slice = std::slice::from_raw_parts(a_send.get(), a_len);
+                let a_slcs = split_a::<K>(a_slice);
 
-                            let mut total_sum_lo = [_mm512_setzero_si512(); K];
-                            let mut total_sum_hi = [_mm512_setzero_si512(); K];
-                            let mut tmp = [_mm512_setzero_si512(); K];
+                // Outer loop over row chunks (accumulation dimension).
+                // Each k_outer processes `chunk_size` groups of 8 (simd_width)
+                // elements, accumulating partial sums in AVX-512 registers.
+                for k_outer in 0..num_chunks {
+                    for j in j_start..j_end {
+                        let mut total_sum_lo = [_mm512_setzero_si512(); K];
+                        let mut total_sum_hi = [_mm512_setzero_si512(); K];
+                        let mut tmp = [_mm512_setzero_si512(); K];
 
-                            // Inner dot-product: multiply 8 a[] values by 8 b[]
-                            // values at a time using _mm512_mul_epu32, accumulating
-                            // low and high 32-bit halves separately to avoid overflow.
-                            for k_inner in 0..chunk_size {
-                                let k = simd_width * (k_outer * chunk_size + k_inner);
-                                let b_val_simd = b_ptr.add(j * b_rows + k).to_m512();
+                        // Inner dot-product: multiply 8 a[] values by 8 b[]
+                        // values at a time using _mm512_mul_epu32, accumulating
+                        // low and high 32-bit halves separately to avoid overflow.
+                        for k_inner in 0..chunk_size {
+                            let k = simd_width * (k_outer * chunk_size + k_inner);
+                            let b_val_simd = b_ptr.add(j * b_rows + k).to_m512();
 
-                                for batch in 0..K {
-                                    tmp[batch] = _mm512_load_si512(
-                                        a_slcs[batch].as_ptr().add(k) as *const _,
-                                    );
-                                }
-
-                                for batch in 0..K {
-                                    let a_val_lo = tmp[batch];
-                                    let a_val_hi = _mm512_srli_epi64(tmp[batch], 32);
-                                    total_sum_lo[batch] = _mm512_add_epi64(
-                                        total_sum_lo[batch],
-                                        _mm512_mul_epu32(a_val_lo, b_val_simd),
-                                    );
-                                    total_sum_hi[batch] = _mm512_add_epi64(
-                                        total_sum_hi[batch],
-                                        _mm512_mul_epu32(a_val_hi, b_val_simd),
-                                    );
-                                }
+                            for batch in 0..K {
+                                tmp[batch] = _mm512_load_si512(
+                                    a_slcs[batch].as_ptr().add(k) as *const _,
+                                );
                             }
 
-                            // K=1-only path: reduce and write back batch 0.
-                            // See the K=1 discussion comment above.
-                            writeback_avx512(params, c_cell, total_sum_lo[0], total_sum_hi[0]);
+                            for batch in 0..K {
+                                let a_val_lo = tmp[batch];
+                                let a_val_hi = _mm512_srli_epi64(tmp[batch], 32);
+                                total_sum_lo[batch] = _mm512_add_epi64(
+                                    total_sum_lo[batch],
+                                    _mm512_mul_epu32(a_val_lo, b_val_simd),
+                                );
+                                total_sum_hi[batch] = _mm512_add_epi64(
+                                    total_sum_hi[batch],
+                                    _mm512_mul_epu32(a_val_hi, b_val_simd),
+                                );
+                            }
+                        }
+
+                        for batch in 0..K {
+                            writeback_avx512(
+                                params,
+                                &mut *c_ptr.add(batch * b_cols + j),
+                                total_sum_lo[batch],
+                                total_sum_hi[batch],
+                            );
                         }
                     }
                 }
-            });
+            }
+        });
         return;
     }
 
+    #[cfg(not(feature = "rayon"))]
     unsafe {
         let a_slcs = split_a::<K>(a);
         let b_ptr = b_t.as_ptr();
@@ -1724,9 +1688,114 @@ mod test {
             );
         }
 
+        #[cfg(feature = "rayon")]
+        fn assert_avx512_rayon_k5_matches_reference(a_elems: usize, b_cols: usize) {
+            let params = test_params();
+            const K: usize = 5;
+
+            let a = random_bounded_aligned(K * a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_ref = vec![0u64; K * b_cols];
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_avx = AlignedMemory64::new(K * b_cols);
+            fast_batched_dot_product_explicit_avx512::<K, _>(
+                &params,
+                c_avx.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(
+                c_avx.as_slice(),
+                c_ref.as_slice(),
+                "rayon AVX-512 K=5 mismatch (a_elems={a_elems}, b_cols={b_cols})"
+            );
+        }
+
         #[test]
         fn test_avx512_standard() {
             assert_avx512_matches_reference(65536, 1024);
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn test_avx512_rayon_k5_matches_reference() {
+            assert_avx512_rayon_k5_matches_reference(65536, 1024);
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn test_avx512_rayon_k5_non_power_of_two_cols() {
+            assert_avx512_rayon_k5_matches_reference(65536, 100);
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn test_avx512_rayon_k5_single_column() {
+            assert_avx512_rayon_k5_matches_reference(65536, 1);
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn test_avx512_rayon_k5_cols_less_than_threads() {
+            let num_threads = rayon::current_num_threads();
+            if num_threads > 3 {
+                assert_avx512_rayon_k5_matches_reference(65536, 3);
+            }
+        }
+
+        #[cfg(feature = "rayon")]
+        #[test]
+        fn test_avx512_rayon_k5_accumulates() {
+            let params = test_params();
+            let a_elems = 65536;
+            let b_cols = 100;
+            const K: usize = 5;
+
+            let a = random_bounded_aligned(K * a_elems, params.modulus);
+            let b_t_u16 = random_u16_vec(a_elems * b_cols);
+
+            let mut c_initial = vec![0u64; K * b_cols];
+            for i in 0..K * b_cols {
+                c_initial[i] = (i as u64 * 17) % params.modulus;
+            }
+            let mut c_ref = c_initial.clone();
+            reference_batched_dot_product_u16::<K>(
+                &params,
+                &mut c_ref,
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            let mut c_rayon = AlignedMemory64::new(K * b_cols);
+            c_rayon.as_mut_slice().copy_from_slice(&c_initial);
+            fast_batched_dot_product_explicit_avx512::<K, _>(
+                &params,
+                c_rayon.as_mut_slice(),
+                a.as_slice(),
+                a_elems,
+                &b_t_u16,
+                a_elems,
+                b_cols,
+            );
+
+            assert_eq!(c_rayon.as_slice(), c_ref.as_slice());
         }
 
         #[cfg(not(feature = "rayon"))]
