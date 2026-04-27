@@ -859,6 +859,94 @@ where
         concated
     }
 
+    /// Like `perform_online_computation_simplepir`, but answers K SimplePIR
+    /// queries against the same DB with a single batched first-pass matvec.
+    pub fn perform_online_computation_simplepir_batched<const K: usize>(
+        &self,
+        first_dim_queries_packed: &[u64],
+        offline_vals: &OfflinePrecomputedValues<'a>,
+        pack_pub_params_row_1s: &[&[u64]; K],
+        mut measurement: Option<&mut Measurement>,
+    ) -> [Vec<u8>; K] {
+        assert!(self.ypir_params.is_simplepir);
+        assert!(K > 0);
+
+        let params = self.params;
+
+        let y_constants = &offline_vals.y_constants;
+        let prepacked_lwe = &offline_vals.prepacked_lwe;
+        let precomp = &offline_vals.precomp;
+
+        let rlwe_q_prime_1 = params.get_q_prime_1();
+        let rlwe_q_prime_2 = params.get_q_prime_2();
+
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_cols = params.instances * params.poly_len;
+
+        assert_eq!(
+            first_dim_queries_packed.len(),
+            K * params.db_rows_padded_simplepir()
+        );
+
+        let first_pass = Instant::now();
+        let mut intermediate = AlignedMemory64::new(K * db_cols);
+        fast_batched_dot_product::<K, T>(
+            &params,
+            intermediate.as_mut_slice(),
+            first_dim_queries_packed,
+            db_rows,
+            self.db(),
+            db_rows,
+            db_cols,
+        );
+        let first_pass_time_ms = first_pass.elapsed().as_millis();
+        if let Some(ref mut m) = measurement {
+            m.online.first_pass_time_ms = first_pass_time_ms as usize;
+        }
+
+        let num_rlwe_outputs = db_cols / params.poly_len;
+        let mut ring_packing_time_ms = 0usize;
+
+        let responses = std::array::from_fn(|slot| {
+            let ring_packing = Instant::now();
+            let pack_pub_params_row_1s_pms =
+                unpack_vec_pm(&params, 1, params.t_exp_left, pack_pub_params_row_1s[slot]);
+            let intermediate_slot = &intermediate.as_slice()[slot * db_cols..(slot + 1) * db_cols];
+            let packed = pack_many_lwes(
+                &params,
+                &prepacked_lwe,
+                &precomp,
+                intermediate_slot,
+                num_rlwe_outputs,
+                &pack_pub_params_row_1s_pms,
+                &y_constants,
+            );
+            ring_packing_time_ms += ring_packing.elapsed().as_millis() as usize;
+
+            let mut packed_mod_switched = Vec::with_capacity(packed.len());
+            for ct in packed.iter() {
+                let res = ct.raw();
+                let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
+                packed_mod_switched.push(res_switched);
+            }
+
+            assert_eq!(packed_mod_switched.len(), num_rlwe_outputs);
+
+            packed_mod_switched
+                .iter()
+                .map(|x| x.as_slice())
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+        });
+
+        if let Some(m) = measurement {
+            m.online.ring_packing_time_ms = ring_packing_time_ms;
+        }
+
+        responses
+    }
+
     pub fn perform_online_computation<const K: usize>(
         &self,
         offline_vals: &mut OfflinePrecomputedValues<'a>,
@@ -1237,6 +1325,62 @@ where
         //     res_u8.extend_from_slice(&x.to_u64().to_le_bytes()[..std::mem::size_of::<T>()]);
         // }
         // res_u8
+    }
+}
+
+#[cfg(test)]
+mod simplepir_batched_tests {
+    use super::*;
+
+    const K: usize = 5;
+
+    #[test]
+    fn simplepir_batched_k5_matches_sequential_responses() {
+        let params = params_for_scenario_simplepir(1 << 11, 2048 * 14);
+        let client = YPIRClient::new(&params);
+        let db_rows = params.db_rows();
+        let db_cols = params.db_cols_simplepir();
+        let db = (0..db_rows * db_cols)
+            .map(|idx| ((idx * 37 + 11) as u64 % params.pt_modulus) as u16)
+            .collect::<Vec<_>>();
+
+        let server = YServer::<u16>::new(&params, db.into_iter(), true, false, false);
+        let offline_vals = server.perform_offline_precomputation_simplepir(None, None, None);
+
+        let queries = [0usize, 1, db_rows / 3, db_rows / 2, db_rows - 1]
+            .map(|target_row| client.generate_query_simplepir(target_row).0);
+
+        let sequential = queries
+            .iter()
+            .map(|(first_dim, pub_params)| {
+                server.perform_online_computation_simplepir(
+                    first_dim.as_slice(),
+                    &offline_vals,
+                    &[pub_params.as_slice()],
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut batched_first_dim = Vec::with_capacity(K * params.db_rows_padded_simplepir());
+        for (first_dim, _) in queries.iter() {
+            batched_first_dim.extend_from_slice(first_dim.as_slice());
+        }
+        let pub_param_slices: [&[u64]; K] = std::array::from_fn(|slot| queries[slot].1.as_slice());
+
+        let batched = server.perform_online_computation_simplepir_batched::<K>(
+            &batched_first_dim,
+            &offline_vals,
+            &pub_param_slices,
+            None,
+        );
+
+        for slot in 0..K {
+            assert_eq!(
+                batched[slot], sequential[slot],
+                "batched SimplePIR response diverged from sequential response at slot {slot}"
+            );
+        }
     }
 }
 
