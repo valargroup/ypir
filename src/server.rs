@@ -1385,3 +1385,128 @@ pub fn naive_multiply_matrices<T: ToU64 + Copy>(
 
     result
 }
+
+// ── Cache I/O for YServer<u16> (warm-restart precompute cache) ───────────────
+//
+// Checked binary dump/load for the YPIR-formatted database (`db_buf_aligned`)
+// and identifying flags. See `serialize::cache_io` for the format conventions
+// and safety contract. Restricted to `T = u16` and `is_simplepir = true`,
+// the only configuration the consumer (vote-nullifier-pir) uses today.
+
+/// YServer dump format version. Bump on any change that breaks cache
+/// validity (wire-format change OR algorithm change that produces different
+/// bytes for the same input). Same convention as `PAYLOAD_FORMAT_V1` in
+/// `crate::serialize`.
+const YSERVER_DUMP_V1: u8 = 1;
+
+impl<'a> YServer<'a, u16> {
+    /// Dump the YPIR-formatted database (and identifying flags) to a writer.
+    /// Format is binary-stable within a major version of `valar-ypir`.
+    /// Intended for warm-restart caching only; see
+    /// [`crate::serialize::cache_io`] for the safety contract.
+    ///
+    /// **Endianness:** the on-wire format is little-endian. Only compiles on
+    /// little-endian targets; same constraint as
+    /// `OfflinePrecomputedValues::dump_into`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if the writer fails. Panics if the
+    /// server was constructed with `is_simplepir = false` or `pad_rows = false`
+    /// (this dump is for the consumer's only configuration today).
+    pub fn dump_into<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        assert!(
+            self.ypir_params.is_simplepir,
+            "dump_into requires is_simplepir = true"
+        );
+        assert!(self.pad_rows, "dump_into requires pad_rows = true");
+
+        crate::serialize::cache_io::write_u8(w, YSERVER_DUMP_V1)?;
+        // flags: bit 0 = pad_rows, bit 1 = is_simplepir. Both are required
+        // true today; load_from rejects anything else.
+        crate::serialize::cache_io::write_u8(w, 0b11)?;
+        crate::serialize::cache_io::dump_aligned_memory64(w, &self.db_buf_aligned)?;
+        Ok(())
+    }
+
+    /// Load a YServer from a reader. Bounds-checks every access; returns
+    /// [`crate::serialize::CacheError`] on truncation, malformed data, or
+    /// version mismatch. Never panics on disk-derived input.
+    ///
+    /// `params` must match the params the cache was originally produced with;
+    /// the consumer is responsible for verifying that via its own header.
+    ///
+    /// **Trailing-byte contract:** consumes exactly the bytes produced by
+    /// one [`Self::dump_into`] call and stops; does NOT check for trailing
+    /// bytes on the reader. Same rationale as
+    /// `OfflinePrecomputedValues::load_from`'s contract.
+    ///
+    /// **Validation order:** the on-disk `db_buf_aligned` length is checked
+    /// against the expected size derived from `params` BEFORE any
+    /// allocation. A corrupted length prefix can't trigger a multi-GB
+    /// allocation before being rejected.
+    pub fn load_from<R: std::io::Read>(
+        r: &mut R,
+        params: &'a Params,
+    ) -> Result<Self, crate::serialize::CacheError> {
+        use crate::serialize::{cache_io, CacheError};
+
+        let v = cache_io::read_u8(r, "YServer dump version")?;
+        if v != YSERVER_DUMP_V1 {
+            return Err(CacheError::Malformed {
+                what: "YServer dump version",
+                detail: format!("unknown version {v}, expected {YSERVER_DUMP_V1}"),
+            });
+        }
+        // Known flag bits for YSERVER_DUMP_V1:
+        //   bit 0: pad_rows  (must be 1 — only configuration we dump)
+        //   bit 1: is_simplepir (must be 1 — only configuration we dump)
+        // Bits 2..=7 are reserved; reject if set so a future format that
+        // assigns them isn't silently mis-loaded by older code.
+        const KNOWN_FLAGS: u8 = 0b0000_0011;
+        let flags = cache_io::read_u8(r, "YServer flags")?;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(CacheError::Malformed {
+                what: "YServer flags",
+                detail: format!(
+                    "unknown flag bits set: 0x{flags:02x} (known mask 0x{KNOWN_FLAGS:02x})"
+                ),
+            });
+        }
+        let pad_rows = flags & 0b01 != 0;
+        let is_simplepir = flags & 0b10 != 0;
+        if !pad_rows || !is_simplepir {
+            return Err(CacheError::Malformed {
+                what: "YServer flags",
+                detail: format!(
+                    "this loader requires pad_rows=true, is_simplepir=true; got pad_rows={pad_rows}, is_simplepir={is_simplepir}"
+                ),
+            });
+        }
+
+        // Compute the expected `db_buf_aligned` length from params and pass
+        // it to the `_exact` loader so the on-disk length prefix is checked
+        // BEFORE allocating. `bytes_per_pt_el = 2` for u16; db_buf_aligned
+        // holds u64s, so length-in-u64 = (db_rows_padded * db_cols * 2) / 8.
+        let db_rows_padded = params.db_rows_padded_simplepir();
+        let db_cols = params.instances * params.poly_len;
+        let expected_u64s = (db_rows_padded * db_cols * 2) / 8;
+        let db_buf_aligned =
+            cache_io::load_aligned_memory64_exact(r, expected_u64s, "db_buf_aligned")?;
+
+        // smaller_params for SimplePIR is just a clone of params.
+        let smaller_params = params.clone();
+
+        let mut ypir_params = YPIRParams::default();
+        ypir_params.is_simplepir = true;
+
+        Ok(YServer {
+            params,
+            smaller_params,
+            db_buf_aligned,
+            phantom: std::marker::PhantomData,
+            pad_rows: true,
+            ypir_params,
+        })
+    }
+}
