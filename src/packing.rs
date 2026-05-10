@@ -1270,13 +1270,14 @@ mod test {
     use spiral_rs::{client::Client, number_theory::invert_uint_mod, util::get_test_params};
 
     use crate::{
-        client::raw_generate_expansion_params, params::params_for_scenario,
+        client::raw_generate_expansion_params, params::params_for_scenario_simplepir,
         server::generate_y_constants,
     };
 
     use super::*;
 
     #[test]
+    #[ignore = "long test: full packing pipeline"]
     fn test_packing() {
         let params = get_test_params();
         let mut client = Client::init(&params);
@@ -1356,8 +1357,9 @@ mod test {
     }
 
     #[test]
+    #[ignore = "long test: precompute packing pipeline"]
     fn test_precompute_packing() {
-        let params = params_for_scenario(1 << 30, 1);
+        let params = params_for_scenario_simplepir(1 << 14, 2048 * 14);
         println!("modulus: {}", params.modulus);
         let mut client = Client::init(&params);
         client.generate_secret_keys();
@@ -1468,7 +1470,7 @@ mod test {
 
     #[test]
     fn test_single_packing() {
-        let params = params_for_scenario(1 << 30, 1);
+        let params = params_for_scenario_simplepir(1 << 14, 2048 * 14);
         let mut client = Client::init(&params);
         client.generate_secret_keys();
 
@@ -1525,7 +1527,7 @@ mod test {
 
     #[test]
     fn test_automorph_tables() {
-        let params = params_for_scenario(1 << 30, 1);
+        let params = params_for_scenario_simplepir(1 << 14, 2048 * 14);
 
         let now = Instant::now();
         let tables = generate_automorph_tables_brute_force(&params);

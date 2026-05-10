@@ -150,4 +150,92 @@ mod test {
             assert_eq!(val, vals[i]);
         }
     }
+
+    #[test]
+    fn u64s_contiguous_bytes_14bit_roundtrip() {
+        let bits = 14;
+        let n = 2048;
+        let vals: Vec<u64> = (0..n).map(|i| (i as u64 * 997) % (1 << bits)).collect();
+        let bytes = u64s_to_contiguous_bytes(&vals, bits);
+        let recovered = contiguous_bytes_to_u64s(&bytes, bits);
+        assert_eq!(recovered.len(), vals.len());
+        assert_eq!(recovered, vals);
+    }
+
+    #[test]
+    fn u64s_contiguous_bytes_14bit_edge_cases() {
+        let bits = 14;
+        let max = (1u64 << bits) - 1;
+        let vals = vec![
+            0,
+            1,
+            max,
+            max - 1,
+            1 << 13,
+            (1 << 13) - 1,
+            0b10101010101010 & max,
+        ];
+        let bytes = u64s_to_contiguous_bytes(&vals, bits);
+        let recovered = contiguous_bytes_to_u64s(&bytes, bits);
+        assert_eq!(recovered, vals);
+    }
+
+    #[test]
+    fn u64s_contiguous_bytes_various_bit_widths() {
+        for bits in [1, 2, 7, 8, 13, 14, 15, 16, 28, 32, 64] {
+            let max = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let n = 100;
+            let vals: Vec<u64> = (0..n).map(|i| (i as u64 * 12347) & max).collect();
+            let bytes = u64s_to_contiguous_bytes(&vals, bits);
+            let recovered = contiguous_bytes_to_u64s(&bytes, bits);
+            // contiguous_bytes_to_u64s may return extra trailing elements due to byte alignment
+            for i in 0..n {
+                assert_eq!(
+                    recovered[i], vals[i],
+                    "round-trip failed at index {i} for bits={bits}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_bits_cross_byte_boundary() {
+        let mut buf = [0u8; 4];
+        write_bits(&mut buf, 0b11_1111_0000_0011, 3, 14);
+        let val = read_bits(&buf, 3, 14);
+        assert_eq!(val, 0b11_1111_0000_0011);
+    }
+
+    #[test]
+    fn u64s_contiguous_bytes_single_element() {
+        for bits in [1, 7, 14, 28, 64] {
+            let max = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let vals = vec![max];
+            let bytes = u64s_to_contiguous_bytes(&vals, bits);
+            let recovered = contiguous_bytes_to_u64s(&bytes, bits);
+            assert!(
+                recovered.len() >= 1,
+                "must recover at least 1 element for bits={bits}"
+            );
+            assert_eq!(
+                recovered[0], vals[0],
+                "single-element round-trip failed for bits={bits}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid number of bits")]
+    fn read_bits_zero_width_panics() {
+        let buf = [0u8; 4];
+        let _ = read_bits(&buf, 0, 0);
+    }
 }

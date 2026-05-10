@@ -1,8 +1,11 @@
 # YPIR
 
-This is an implementation of the YPIR scheme for single-server private information retrieval,
+This is a fork of the [YPIR](https://github.com/menonsamir/ypir) implementation of the YPIR scheme for single-server private information retrieval,
 introduced in ["YPIR: High-Throughput Single-Server PIR with Silent Preprocessing"](https://eprint.iacr.org/2024/270).
-This is joint work with [David Wu](https://www.cs.utexas.edu/~dwu4/).
+
+This fork has been **audited by [Zellic](https://zellic.io)**. The audit report is available in [`audits/zellic-audit-report.pdf`](audits/zellic-audit-report.pdf).
+
+**Client-side code is considered frozen** in this repository. Server-side code remains open to changes. This is because these changes can only affect performance, they cannot break client privacy. A server-side change could break integrity, as could a malicious server. However, all authentication of data retrieved is not done at the cryptographic layer in YPIR, but instead is an application-layer concern. In our usages within voting and spendability, authentication is explicitly addressed (via merkle path authentication checks against a trusted merkle root, or recursive proofs post-Tachyon).
 
 ## Running
 
@@ -10,11 +13,11 @@ To build and run this code:
 1. Ensure you are running on Ubuntu (at least 22.04), and that AVX-512 is available on the CPU (you can run `lscpu` and look for the `avx512f` flag).
 Our benchmarks were collected using the AWS `r6i.16xlarge` instance type, which has all necessary CPU features.
 2. Run `sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config`.
-2. [Install Rust using rustup](https://www.rust-lang.org/tools/install) using `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
+3. [Install Rust using rustup](https://www.rust-lang.org/tools/install) using `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
   - Select `1) Proceed with installation (default)` when prompted
   - After installation, configure the current shell as instructed by running `source "$HOME/.cargo/env"`
-3. Run `git clone https://github.com/menonsamir/ypir.git` and `cd ypir`.
-4. Run `cargo run --release -- 1073741824` to run YPIR on a random database consisting of 1073741824 bits (~134 MB).
+4. Run `git clone https://github.com/valargroup/ypir.git` and `cd ypir`.
+5. Run `cargo run --release -- 32768 131072` to run YPIR-SP on a random database of 32768 items, each 131072 bits.
 The first time you run this command, Cargo will download and install the necessary libraries to build the code (~2 minutes);
 later calls will not take as long. Stability warnings can be safely ignored. 
 See below for details on how to interpret the measurements.
@@ -28,12 +31,11 @@ will enable detailed logging. All PIR results are checked for correctness.
 The full command-line parameters are as follows:
 
 ```
-Usage: cargo run --release -- [OPTIONS] <NUM_ITEMS> [ITEM_SIZE_BITS] [NUM_CLIENTS] [TRIALS] [OUT_REPORT_JSON]
+Usage: cargo run --release -- [OPTIONS] <NUM_ITEMS> [ITEM_SIZE_BITS] [TRIALS] [OUT_REPORT_JSON]
 
 Arguments:
   <NUM_ITEMS>        Number of items in the database
-  [ITEM_SIZE_BITS]   Size of each item in bits (optional, default 1), values over 8 are unsupported
-  [NUM_CLIENTS]      Number of clients (optional, default 1) to perform cross-client batching over
+  [ITEM_SIZE_BITS]   Size of each item in bits (optional, default 131072)
   [TRIALS]           Number of trials (optional, default 5) to run the YPIR scheme 
                      and average performance measurements over (with one additional warmup trial excluded)
   [OUT_REPORT_JSON]  Output report file (optional) where results will be written in JSON
@@ -68,14 +70,8 @@ detailing what each measurement means:
     // Time spent precomputing just the SimplePIR hint.
     "simplepirPrepTimeMs": 2539,
 
-    // Bytes that the client *would* have to download, in the offline phase,
-    // if they were performing SimplePIR (rather than YPIR) 
-    // using this implementation (SimplePIR* in the paper).
-    "simplepirHintBytes": 29360128,
-
-    // Similarly, bytes that the client *would* have to download, 
-    // in the offline phase DoublePIR (DoublePIR* in the paper).
-    "doublepirHintBytes": 14680064
+    // Bytes for the SimplePIR hint used by YPIR-SP.
+    "simplepirHintBytes": 29360128
   },
   "online": {
     // Bytes uploaded by a single client in the online phase.
@@ -84,13 +80,8 @@ detailing what each measurement means:
     // Bytes downloaded by a single client in the online phase.
     "downloadBytes": 12288,
 
-    // Bytes that the client *would* have to download, in the online phase,
-    // if they were performing SimplePIR (SimplePIR* in the paper).
+    // Bytes in the SimplePIR first-pass response before packing.
     "simplepirRespBytes": 28672,
-
-    // Bytes that the client *would* have to download, in the online phase,
-    // if they were performing DoublePIR (DoublePIR* in the paper).
-    "doublepirRespBytes": 12288,
 
     // Server computation time, in milliseconds, in the online phase.
     // This is the average time over 5 trials, after a warmup trial.
@@ -105,14 +96,8 @@ detailing what each measurement means:
     // Time spent in the first pass of YPIR (the 'SimplePIR' phase)
     "firstPassTimeMs": 9,
 
-    // Time spent in the second pass of YPIR (the 'DoublePIR' phase)
-    "secondPassTimeMs": 3,
-
     // Time spent performing LWE-to-RLWE conversion
     "ringPackingTimeMs": 387,
-
-    // Not used.
-    "sqrtNBytes": 8192,
 
     // The full set of measured server computation times.
     "allServerTimesMs": [
@@ -134,7 +119,7 @@ You can run YPIR as a standalone HTTP server using a command like:
 
 
 ```sh
-$ RUST_LOG=debug cargo run --profile release-with-debug --bin server 32768 262144 --is-simplepir --inp-file ../passwords-data/hibp-passwords.bin -p 8989 --hint-file ../passwords-data/hibp-passwords-2-hint.bin
+$ RUST_LOG=debug cargo run --profile release-with-debug --features http_server --bin server 32768 262144 --inp-file ../passwords-data/hibp-passwords.bin -p 8989 --hint-file ../passwords-data/hibp-passwords-2-hint.bin
 ```
 
 
@@ -142,11 +127,11 @@ $ RUST_LOG=debug cargo run --profile release-with-debug --bin server 32768 26214
 
 YPIR is based on [DoublePIR](https://eprint.iacr.org/2022/949), and this implementation
 uses matrix-vector multiplication routines based on the ones in [ahenzinger/simplepir](https://github.com/ahenzinger/simplepir).
-We also use the [menonsamir/spiral-rs](https://github.com/menonsamir/spiral-rs) library for Spiral to handle RLWE ciphertexts.
+We also use a [fork of spiral-rs](https://github.com/valargroup/spiral-rs) for Spiral to handle RLWE ciphertexts.
 
 ## Citing
 
-Please cite this work as:
+Please cite the original work as:
 
 ```
 @inproceedings{MW24,
@@ -156,3 +141,5 @@ Please cite this work as:
   year      = {2024}
 }
 ```
+
+This fork is maintained by [valargroup](https://github.com/valargroup).

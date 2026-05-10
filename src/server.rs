@@ -144,11 +144,9 @@ pub fn generate_fake_pack_pub_params<'a>(params: &'a Params) -> Vec<PolyMatrixNT
 #[derive(Clone)]
 pub struct YServer<'a, T> {
     params: &'a Params,
-    smaller_params: Params,
     db_buf_aligned: AlignedMemory64, // db_buf: Vec<u8>, // stored transposed
     phantom: PhantomData<T>,
     pad_rows: bool,
-    ypir_params: YPIRParams,
 }
 
 impl<'a, T> YServer<'a, T>
@@ -156,37 +154,19 @@ where
     T: Sized + Copy + ToU64 + Default,
     *const T: ToM512 + ToU64,
 {
-    pub fn new<'b, I>(
-        params: &'a Params,
-        mut db: I,
-        is_simplepir: bool,
-        inp_transposed: bool,
-        pad_rows: bool,
-    ) -> Self
+    pub fn new<'b, I>(params: &'a Params, mut db: I, inp_transposed: bool, pad_rows: bool) -> Self
     where
         I: Iterator<Item = T>,
     {
-        // TODO: hack
-        // let lwe_params = LWEParams::default();
-        let mut ypir_params = YPIRParams::default();
-        ypir_params.is_simplepir = is_simplepir;
         let bytes_per_pt_el = std::mem::size_of::<T>(); //1; //((lwe_params.pt_modulus as f64).log2() / 8.).ceil() as usize;
 
         let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
         let db_rows_padded = if pad_rows {
-            if is_simplepir {
-                params.db_rows_padded_simplepir()
-            } else {
-                params.db_rows_padded_normal()
-            }
+            params.db_rows_padded_simplepir()
         } else {
             db_rows
         };
-        let db_cols = if is_simplepir {
-            params.instances * params.poly_len
-        } else {
-            1 << (params.db_dim_2 + params.poly_len_log2)
-        };
+        let db_cols = params.instances * params.poly_len;
 
         let sz_bytes = db_rows_padded * db_cols * bytes_per_pt_el;
 
@@ -213,33 +193,11 @@ where
             }
         }
 
-        // Parameters for the second round (the "DoublePIR" round)
-        let smaller_params = if is_simplepir {
-            params.clone()
-        } else {
-            let lwe_params = LWEParams::default();
-            let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-            let blowup_factor = lwe_params.q2_bits as f64 / pt_bits as f64;
-            let mut smaller_params = params.clone();
-            smaller_params.db_dim_1 = params.db_dim_2;
-            smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
-                / params.poly_len as f64)
-                .log2()
-                .ceil() as usize;
-
-            let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
-            assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
-            assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
-            smaller_params
-        };
-
         Self {
             params,
-            smaller_params,
             db_buf_aligned,
             phantom: PhantomData,
             pad_rows,
-            ypir_params,
         }
     }
 
@@ -249,22 +207,14 @@ where
 
     pub fn db_rows_padded(&self) -> usize {
         if self.pad_rows {
-            if self.ypir_params.is_simplepir {
-                self.params.db_rows_padded_simplepir()
-            } else {
-                self.params.db_rows_padded_normal()
-            }
+            self.params.db_rows_padded_simplepir()
         } else {
             1 << (self.params.db_dim_1 + self.params.poly_len_log2)
         }
     }
 
     pub fn db_cols(&self) -> usize {
-        if self.ypir_params.is_simplepir {
-            self.params.instances * self.params.poly_len
-        } else {
-            1 << (self.params.db_dim_2 + self.params.poly_len_log2)
-        }
+        self.params.instances * self.params.poly_len
     }
 
     pub fn multiply_batched_with_db_packed<const K: usize>(
@@ -342,7 +292,7 @@ where
         &self,
         preprocessed_query: &[PolyMatrixNTT],
         col_range: Range<usize>,
-        seed_idx: u8,
+        _seed_idx: u8,
     ) -> Vec<u64> {
         let db_rows_poly = 1 << (self.params.db_dim_1);
         let db_rows = 1 << (self.params.db_dim_1 + self.params.poly_len_log2);
@@ -389,15 +339,7 @@ where
             }
 
             let sum_raw = sum.raw();
-
-            // do negacyclic permutation (for first mul only)
-            if seed_idx == SEED_0 && !self.ypir_params.is_simplepir {
-                let sum_raw_transformed =
-                    negacyclic_perm(sum_raw.get_poly(0, 0), 0, self.params.modulus);
-                result.extend(&sum_raw_transformed);
-            } else {
-                result.extend(sum_raw.as_slice());
-            }
+            result.extend(sum_raw.as_slice());
         }
 
         // result
@@ -567,8 +509,6 @@ where
         // Set up some parameters
 
         let params = self.params;
-        assert!(self.ypir_params.is_simplepir);
-
         let db_cols = params.instances * params.poly_len;
         let num_rlwe_outputs = db_cols / params.poly_len;
 
@@ -614,158 +554,7 @@ where
 
         OfflinePrecomputedValues {
             hint_0,
-            hint_1: vec![],
-            pseudorandom_query_1: vec![],
             y_constants,
-            smaller_server: None,
-            prepacked_lwe,
-            fake_pack_pub_params,
-            precomp,
-        }
-    }
-
-    pub fn perform_offline_precomputation(
-        &self,
-        measurement: Option<&mut Measurement>,
-    ) -> OfflinePrecomputedValues {
-        // Set up some parameters
-
-        let params = self.params;
-        let lwe_params = LWEParams::default();
-        assert!(!self.ypir_params.is_simplepir);
-
-        let db_cols = 1 << (params.db_dim_2 + params.poly_len_log2);
-
-        // LWE reduced moduli
-        let lwe_q_prime_bits = lwe_params.q2_bits as usize;
-        let lwe_q_prime = lwe_params.get_q_prime_2();
-
-        // The number of bits represented by a plaintext RLWE coefficient
-        let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-        // assert_eq!(pt_bits, 16);
-
-        // The factor by which ciphertext values are bigger than plaintext values
-        let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
-        debug!("blowup_factor: {}", blowup_factor);
-        // assert!(blowup_factor.ceil() - blowup_factor >= 0.05);
-
-        // The starting index of the final value (the '1' in lwe_params.n + 1)
-        // This is rounded to start on a pt_bits boundary
-        let special_offs =
-            ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
-        let special_bit_offs = special_offs * pt_bits;
-
-        // Parameters for the second round (the "DoublePIR" round)
-        let mut smaller_params = params.clone();
-        smaller_params.db_dim_1 = params.db_dim_2;
-        smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
-            / params.poly_len as f64)
-            .log2()
-            .ceil() as usize;
-
-        let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
-        let rho = 1 << smaller_params.db_dim_2;
-        assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
-        assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
-
-        debug!(
-            "the first {} LWE output ciphertexts of the DoublePIR round (out of {} total) are query-indepednent",
-            special_offs, out_rows
-        );
-        debug!(
-            "the next {} LWE output ciphertexts are query-dependent",
-            blowup_factor.ceil() as usize
-        );
-        debug!("the rest are zero");
-
-        // Begin offline precomputation
-
-        let now = Instant::now();
-        let hint_0: Vec<u64> = self.generate_hint_0_ring();
-        // hint_0 is n x db_cols
-        let simplepir_prep_time_ms = now.elapsed().as_millis();
-        if let Some(measurement) = measurement {
-            measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
-        }
-        debug!("Answered hint (ring) in {} us", now.elapsed().as_micros());
-
-        // compute (most of) the secondary hint
-        let intermediate_cts = [&hint_0[..], &vec![0u64; db_cols]].concat();
-        let intermediate_cts_rescaled = intermediate_cts
-            .iter()
-            .map(|x| rescale(*x, lwe_params.modulus, lwe_q_prime))
-            .collect::<Vec<_>>();
-
-        // split and do a second PIR over intermediate_cts
-        // split into blowup_factor=q/p instances (so that all values are now mod p)
-        // the second PIR is over a database of db_cols x (blowup_factor * (lwe_params.n + 1)) values mod p
-
-        // inp: (lwe_params.n + 1, db_cols)
-        // out: (out_rows >= (lwe_params.n + 1) * blowup_factor, db_cols)
-        //      we are 'stretching' the columns (and padding)
-
-        debug!("Splitting intermediate cts...");
-
-        let smaller_db = split_alloc(
-            &intermediate_cts_rescaled,
-            special_bit_offs,
-            lwe_params.n + 1,
-            db_cols,
-            out_rows,
-            lwe_q_prime_bits,
-            pt_bits,
-        );
-        assert_eq!(smaller_db.len(), db_cols * out_rows);
-
-        debug!("Done splitting intermediate cts.");
-
-        // This is the 'intermediate' db after the first pass of PIR and expansion
-        let smaller_server: YServer<u16> = YServer::<u16>::new(
-            &self.smaller_params,
-            smaller_db.into_iter(),
-            false,
-            true,
-            false,
-        );
-        debug!("gen'd smaller server.");
-
-        let hint_1 = smaller_server.answer_hint_ring(
-            SEED_1,
-            1 << (smaller_server.params.db_dim_2 + smaller_server.params.poly_len_log2),
-        );
-        assert_eq!(hint_1.len(), params.poly_len * out_rows);
-        assert_eq!(hint_1[special_offs], 0);
-        assert_eq!(hint_1[special_offs + 1], 0);
-
-        let pseudorandom_query_1 = smaller_server.generate_pseudorandom_query(SEED_1);
-        let y_constants = generate_y_constants(&params);
-
-        let combined = [&hint_1[..], &vec![0u64; out_rows]].concat();
-        assert_eq!(combined.len(), out_rows * (params.poly_len + 1));
-        let prepacked_lwe = prep_pack_many_lwes(&params, &combined, rho);
-
-        let now = Instant::now();
-        let fake_pack_pub_params = generate_fake_pack_pub_params(&params);
-
-        let mut precomp: Precomp = Vec::new();
-        for i in 0..prepacked_lwe.len() {
-            let tup = precompute_pack(
-                params,
-                params.poly_len_log2,
-                &prepacked_lwe[i],
-                &fake_pack_pub_params,
-                &y_constants,
-            );
-            precomp.push(tup);
-        }
-        debug!("Precomp in {} us", now.elapsed().as_micros());
-
-        OfflinePrecomputedValues {
-            hint_0,
-            hint_1,
-            pseudorandom_query_1,
-            y_constants,
-            smaller_server: Some(smaller_server),
             prepacked_lwe,
             fake_pack_pub_params,
             precomp,
@@ -780,8 +569,6 @@ where
         pack_pub_params_row_1s: &[&[u64]],
         mut measurement: Option<&mut Measurement>,
     ) -> Vec<u8> {
-        assert!(self.ypir_params.is_simplepir);
-
         // Set up some parameters
 
         let params = self.params;
@@ -857,298 +644,6 @@ where
             .collect::<Vec<_>>();
 
         concated
-    }
-
-    pub fn perform_online_computation<const K: usize>(
-        &self,
-        offline_vals: &mut OfflinePrecomputedValues<'a>,
-        first_dim_queries_packed: &[u32],
-        second_dim_queries: &[(&[u64], &[u64])],
-        mut measurement: Option<&mut Measurement>,
-    ) -> Vec<Vec<u8>> {
-        // Set up some parameters
-
-        let params = self.params;
-        let lwe_params = LWEParams::default();
-
-        let db_cols = self.db_cols();
-
-        // RLWE reduced moduli
-        let rlwe_q_prime_1 = params.get_q_prime_1();
-        let rlwe_q_prime_2 = params.get_q_prime_2();
-
-        // LWE reduced moduli
-        let lwe_q_prime_bits = lwe_params.q2_bits as usize;
-        let lwe_q_prime = lwe_params.get_q_prime_2();
-
-        // The number of bits represented by a plaintext RLWE coefficient
-        let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
-        // assert_eq!(pt_bits, 16);
-
-        // The factor by which ciphertext values are bigger than plaintext values
-        let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
-        debug!("blowup_factor: {}", blowup_factor);
-        // assert!(blowup_factor.ceil() - blowup_factor >= 0.05);
-
-        // The starting index of the final value (the '1' in lwe_params.n + 1)
-        // This is rounded to start on a pt_bits boundary
-        let special_offs =
-            ((lwe_params.n * lwe_q_prime_bits) as f64 / pt_bits as f64).ceil() as usize;
-
-        // Parameters for the second round (the "DoublePIR" round)
-        let mut smaller_params = params.clone();
-        smaller_params.db_dim_1 = params.db_dim_2;
-        smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
-            / params.poly_len as f64)
-            .log2()
-            .ceil() as usize;
-
-        let out_rows = 1 << (smaller_params.db_dim_2 + params.poly_len_log2);
-        let rho = 1 << smaller_params.db_dim_2;
-        assert_eq!(smaller_params.db_dim_1, params.db_dim_2);
-        assert!(out_rows as f64 >= (blowup_factor * (lwe_params.n + 1) as f64));
-
-        // Load offline precomputed values
-        let hint_1_combined = &mut offline_vals.hint_1;
-        let pseudorandom_query_1 = &offline_vals.pseudorandom_query_1;
-        let y_constants = &offline_vals.y_constants;
-        let smaller_server = offline_vals.smaller_server.as_mut().unwrap();
-        let prepacked_lwe = &offline_vals.prepacked_lwe;
-        let fake_pack_pub_params = &offline_vals.fake_pack_pub_params;
-        let precomp = &offline_vals.precomp;
-
-        // Begin online computation
-
-        let online_phase = Instant::now();
-        let first_pass = Instant::now();
-        let intermediate = self.lwe_multiply_batched_with_db_packed::<K>(first_dim_queries_packed);
-        let simplepir_resp_bytes = intermediate.len() / K * (lwe_q_prime_bits as usize) / 8;
-        debug!("simplepir_resp_bytes {} bytes", simplepir_resp_bytes);
-        let first_pass_time_ms = first_pass.elapsed().as_millis();
-        debug!("First pass took {} us", first_pass.elapsed().as_micros());
-
-        if let Some(ref mut m) = measurement {
-            m.online.first_pass_time_ms = first_pass_time_ms as usize;
-            m.online.simplepir_resp_bytes = simplepir_resp_bytes;
-        }
-
-        debug!("intermediate.len(): {}", intermediate.len());
-        let mut second_pass_time_ms = 0;
-        let mut ring_packing_time_ms = 0;
-        let mut responses = Vec::new();
-        for (intermediate_chunk, (packed_query_col, pack_pub_params_row_1s)) in intermediate
-            .as_slice()
-            .chunks(db_cols)
-            .zip(second_dim_queries.iter())
-        {
-            let second_pass = Instant::now();
-            let intermediate_cts_rescaled = intermediate_chunk
-                .iter()
-                .map(|x| rescale(*x as u64, lwe_params.modulus, lwe_q_prime))
-                .collect::<Vec<_>>();
-            assert_eq!(intermediate_cts_rescaled.len(), db_cols);
-            debug!(
-                "intermediate_cts_rescaled[0] = {}",
-                intermediate_cts_rescaled[0]
-            );
-
-            let now = Instant::now();
-            // modify the smaller_server db to include the intermediate values
-            // let mut smaller_server_clone = smaller_server.clone();
-            {
-                // remember, this is stored in 'transposed' form
-                // so it is out_cols x db_cols
-                let smaller_db_mut: &mut [u16] = smaller_server.db_mut();
-                for j in 0..db_cols {
-                    // new value to write into the db
-                    let val = intermediate_cts_rescaled[j];
-
-                    for m in 0..blowup_factor.ceil() as usize {
-                        // index in the transposed db
-                        let out_idx = (special_offs + m) * db_cols + j;
-
-                        // part of the value to write into the db
-                        let val_part = ((val >> (m * pt_bits)) & ((1 << pt_bits) - 1)) as u16;
-
-                        // assert_eq!(smaller_db_mut[out_idx], DoubleType::default());
-                        smaller_db_mut[out_idx] = val_part;
-                    }
-                }
-            }
-            debug!("load secondary hint {} us", now.elapsed().as_micros());
-
-            let now = Instant::now();
-            {
-                let blowup_factor_ceil = blowup_factor.ceil() as usize;
-
-                let phase = Instant::now();
-                let secondary_hint = smaller_server.multiply_with_db_ring(
-                    &pseudorandom_query_1,
-                    special_offs..special_offs + blowup_factor_ceil,
-                    SEED_1,
-                );
-                debug!(
-                    "multiply_with_db_ring took: {} us",
-                    phase.elapsed().as_micros()
-                );
-                // let phase = Instant::now();
-                // let secondary_hint =
-                //     smaller_server_clone.answer_hint(SEED_1, special_offs..special_offs + blowup_factor_ceil);
-                // debug!(
-                //     "traditional answer_hint took: {} us",
-                //     phase.elapsed().as_micros()
-                // );
-
-                assert_eq!(secondary_hint.len(), params.poly_len * blowup_factor_ceil);
-
-                for i in 0..params.poly_len {
-                    for j in 0..blowup_factor_ceil {
-                        let inp_idx = i * blowup_factor_ceil + j;
-                        let out_idx = i * out_rows + special_offs + j;
-
-                        // assert_eq!(hint_1_combined[out_idx], 0); // we no longer clone for each query, just overwrite
-                        hint_1_combined[out_idx] = secondary_hint[inp_idx];
-                    }
-                }
-            }
-            debug!("compute secondary hint in {} us", now.elapsed().as_micros());
-
-            assert_eq!(hint_1_combined.len(), params.poly_len * out_rows);
-
-            let response: AlignedMemory64 = smaller_server.answer_query(packed_query_col);
-
-            second_pass_time_ms += second_pass.elapsed().as_millis();
-            let ring_packing = Instant::now();
-            let now = Instant::now();
-            assert_eq!(response.len(), 1 * out_rows);
-
-            // combined is now (poly_len + 1) * (out_rows)
-            // let combined = [&hint_1_combined[..], response.as_slice()].concat();
-            let mut excess_cts = Vec::with_capacity(blowup_factor.ceil() as usize);
-            for j in special_offs..special_offs + blowup_factor.ceil() as usize {
-                let mut rlwe_ct = PolyMatrixRaw::zero(&params, 2, 1);
-
-                // 'a' vector
-                // put this in negacyclic order
-                let mut poly = Vec::new();
-                for k in 0..params.poly_len {
-                    poly.push(hint_1_combined[k * out_rows + j]);
-                }
-                let nega = negacyclic_perm(&poly, 0, params.modulus);
-
-                rlwe_ct.get_poly_mut(0, 0).copy_from_slice(&nega);
-
-                // for k in 0..params.poly_len {
-                //     rlwe_ct.get_poly_mut(0, 0)[k] = nega[k];
-                // }
-
-                // let j_within_last = j % params.poly_len;
-                // prepacked_lwe_mut.last_mut().unwrap()[j_within_last] = rlwe_ct.ntt();
-                excess_cts.push(rlwe_ct.ntt());
-            }
-            debug!("in between: {} us", now.elapsed().as_micros());
-
-            // assert_eq!(pack_pub_params_row_1s[0].rows, 1);
-
-            let pack_pub_params_row_1s_pms =
-                unpack_vec_pm(&params, 1, params.t_exp_left, pack_pub_params_row_1s);
-            let mut packed = pack_many_lwes(
-                &params,
-                &prepacked_lwe,
-                &precomp,
-                response.as_slice(),
-                rho,
-                &pack_pub_params_row_1s_pms,
-                &y_constants,
-            );
-
-            let now = Instant::now();
-            let mut pack_pub_params = fake_pack_pub_params.clone();
-            for i in 0..pack_pub_params.len() {
-                let uncondensed = uncondense_matrix(params, &pack_pub_params_row_1s_pms[i]);
-                pack_pub_params[i].copy_into(&uncondensed, 1, 0);
-            }
-            debug!("uncondense pub params: {} us", now.elapsed().as_micros());
-            let now = Instant::now();
-            let other_packed =
-                pack_using_single_with_offset(&params, &pack_pub_params, &excess_cts, special_offs);
-            add_into(&mut packed[0], &other_packed);
-            debug!(
-                "pack_using_single_with_offset: {} us",
-                now.elapsed().as_micros()
-            );
-
-            let now = Instant::now();
-            let mut packed_mod_switched = Vec::with_capacity(packed.len());
-            for ct in packed.iter() {
-                let res = ct.raw();
-                let res_switched = res.switch(rlwe_q_prime_1, rlwe_q_prime_2);
-                packed_mod_switched.push(res_switched);
-            }
-            debug!("switching: {} us", now.elapsed().as_micros());
-            // debug!("Preprocessing pack in {} us", now.elapsed().as_micros());
-            // debug!("");
-            ring_packing_time_ms += ring_packing.elapsed().as_millis();
-
-            // packed is blowup_factor ring ct's
-            // these encode, contiguously [poly_len + 1, blowup_factor]
-            // (and some padding)
-            assert_eq!(packed.len(), rho);
-
-            let concated = packed_mod_switched
-                .into_iter()
-                .flat_map(|x| x.into_iter())
-                .collect::<Vec<_>>();
-
-            responses.push(concated);
-        }
-        debug!(
-            "Total online time: {} us",
-            online_phase.elapsed().as_micros()
-        );
-        debug!("");
-
-        if let Some(ref mut m) = measurement {
-            m.online.second_pass_time_ms = second_pass_time_ms as usize;
-            m.online.ring_packing_time_ms = ring_packing_time_ms as usize;
-        }
-
-        assert_eq!(responses.len(), K);
-
-        responses
-    }
-
-    pub fn perform_full_online_computation(
-        &self,
-        offline_vals: &mut OfflinePrecomputedValues<'a>,
-        query: &[u8],
-    ) -> Vec<u8> {
-        let first_dim_bytes_sz = self.params.db_rows_padded_normal() * std::mem::size_of::<u32>();
-        let second_dim_bytes_sz = self.db_cols() * std::mem::size_of::<u64>();
-        let pub_param_bytes_sz = self.params.poly_len_log2
-            * self.params.t_exp_left
-            * self.params.poly_len
-            * std::mem::size_of::<u64>();
-        assert_eq!(
-            query.len(),
-            first_dim_bytes_sz + second_dim_bytes_sz + pub_param_bytes_sz
-        );
-
-        let first_dim_bytes = &query[..first_dim_bytes_sz];
-        let second_dim_bytes = &query[first_dim_bytes_sz..first_dim_bytes_sz + second_dim_bytes_sz];
-        let pub_param_bytes = &query[first_dim_bytes_sz + second_dim_bytes_sz..];
-
-        let first_dim = Vec::<u32>::from_bytes(first_dim_bytes);
-        let second_dim = AlignedMemory64::from_bytes(second_dim_bytes);
-        let pub_params = AlignedMemory64::from_bytes(pub_param_bytes);
-
-        self.perform_online_computation::<1>(
-            offline_vals,
-            &first_dim,
-            &[(second_dim.as_slice(), pub_params.as_slice())],
-            None,
-        )
-        .remove(0)
     }
 
     pub fn perform_full_online_computation_simplepir(
@@ -1384,4 +879,112 @@ pub fn naive_multiply_matrices<T: ToU64 + Copy>(
     }
 
     result
+}
+
+// ── Cache I/O for YServer<u16> (warm-restart precompute cache) ───────────────
+//
+// Checked binary dump/load for the YPIR-formatted database (`db_buf_aligned`)
+// and identifying flags. See `serialize::cache_io` for the format conventions
+// and safety contract. Restricted to `T = u16` with padded SimplePIR rows,
+// the only configuration the consumer (vote-nullifier-pir) uses today.
+
+/// YServer dump format version. Bump on any change that breaks cache
+/// validity (wire-format change OR algorithm change that produces different
+/// bytes for the same input). Same convention as `PAYLOAD_FORMAT_V1` in
+/// `crate::serialize`.
+const YSERVER_DUMP_V1: u8 = 2;
+
+impl<'a> YServer<'a, u16> {
+    /// Dump the YPIR-formatted database (and identifying flags) to a writer.
+    /// Format is binary-stable within a major version of `valar-ypir`.
+    /// Intended for warm-restart caching only; see
+    /// [`crate::serialize::cache_io`] for the safety contract.
+    ///
+    /// **Endianness:** the on-wire format is little-endian. Only compiles on
+    /// little-endian targets; same constraint as
+    /// `OfflinePrecomputedValues::dump_into`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if the writer fails. Panics if the
+    /// server was constructed with `pad_rows = false` (this dump is for the
+    /// consumer's only configuration today).
+    pub fn dump_into<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        assert!(self.pad_rows, "dump_into requires pad_rows = true");
+
+        crate::serialize::cache_io::write_u8(w, YSERVER_DUMP_V1)?;
+        // flags: bit 0 = pad_rows. This cache format is SP-only.
+        crate::serialize::cache_io::write_u8(w, 0b01)?;
+        crate::serialize::cache_io::dump_aligned_memory64(w, &self.db_buf_aligned)?;
+        Ok(())
+    }
+
+    /// Load a YServer from a reader. Bounds-checks every access; returns
+    /// [`crate::serialize::CacheError`] on truncation, malformed data, or
+    /// version mismatch. Never panics on disk-derived input.
+    ///
+    /// `params` must match the params the cache was originally produced with;
+    /// the consumer is responsible for verifying that via its own header.
+    ///
+    /// **Trailing-byte contract:** consumes exactly the bytes produced by
+    /// one [`Self::dump_into`] call and stops; does NOT check for trailing
+    /// bytes on the reader. Same rationale as
+    /// `OfflinePrecomputedValues::load_from`'s contract.
+    ///
+    /// **Validation order:** the on-disk `db_buf_aligned` length is checked
+    /// against the expected size derived from `params` BEFORE any
+    /// allocation. A corrupted length prefix can't trigger a multi-GB
+    /// allocation before being rejected.
+    pub fn load_from<R: std::io::Read>(
+        r: &mut R,
+        params: &'a Params,
+    ) -> Result<Self, crate::serialize::CacheError> {
+        use crate::serialize::{cache_io, CacheError};
+
+        let v = cache_io::read_u8(r, "YServer dump version")?;
+        if v != YSERVER_DUMP_V1 {
+            return Err(CacheError::Malformed {
+                what: "YServer dump version",
+                detail: format!("unknown version {v}, expected {YSERVER_DUMP_V1}"),
+            });
+        }
+        // Known flag bits for YSERVER_DUMP_V1:
+        //   bit 0: pad_rows  (must be 1 — only configuration we dump)
+        // Bits 1..=7 are reserved; reject if set so a future format that
+        // assigns them isn't silently mis-loaded by older code.
+        const KNOWN_FLAGS: u8 = 0b0000_0001;
+        let flags = cache_io::read_u8(r, "YServer flags")?;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(CacheError::Malformed {
+                what: "YServer flags",
+                detail: format!(
+                    "unknown flag bits set: 0x{flags:02x} (known mask 0x{KNOWN_FLAGS:02x})"
+                ),
+            });
+        }
+        let pad_rows = flags & 0b01 != 0;
+        if !pad_rows {
+            return Err(CacheError::Malformed {
+                what: "YServer flags",
+                detail: format!("this loader requires pad_rows=true; got pad_rows={pad_rows}"),
+            });
+        }
+
+        // Compute the expected `db_buf_aligned` length from params and pass
+        // it to the `_exact` loader so the on-disk length prefix is checked
+        // BEFORE allocating. `bytes_per_pt_el = 2` for u16; db_buf_aligned
+        // holds u64s, so length-in-u64 = (db_rows_padded * db_cols * 2) / 8.
+        let db_rows_padded = params.db_rows_padded_simplepir();
+        let db_cols = params.instances * params.poly_len;
+        let expected_u64s = (db_rows_padded * db_cols * 2) / 8;
+        let db_buf_aligned =
+            cache_io::load_aligned_memory64_exact(r, expected_u64s, "db_buf_aligned")?;
+
+        Ok(YServer {
+            params,
+            db_buf_aligned,
+            phantom: std::marker::PhantomData,
+            pad_rows: true,
+        })
+    }
 }

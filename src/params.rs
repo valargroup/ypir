@@ -96,29 +96,6 @@ fn internal_params_for(
     ))
 }
 
-pub fn params_for_scenario(num_items: u64, item_size_bits: u64) -> Params {
-    let total_db_bytes = num_items * item_size_bits / 8;
-    let lwe_pt_word_bytes = 1;
-    let num_items = total_db_bytes / lwe_pt_word_bytes;
-    let num_tiles = num_items as f64 / (2048. * 2048.);
-    let num_tiles_usize = num_tiles.ceil() as usize;
-    let num_tiles_log2 = (num_tiles_usize as f64).log2().ceil() as usize;
-
-    let (nu_1, nu_2) = if num_tiles_log2 % 2 == 0 {
-        (num_tiles_log2 / 2, num_tiles_log2 / 2)
-    } else {
-        ((num_tiles_log2 + 1) / 2, (num_tiles_log2 - 1) / 2)
-    };
-
-    debug!("chose nu_1: {}, nu_2: {}", nu_1, nu_2);
-
-    let p = 32768;
-    let q2_bits = 28;
-    let t_exp_left = 3;
-
-    internal_params_for(nu_1, nu_2, p, q2_bits, t_exp_left, DEF_MOD_STR)
-}
-
 pub fn params_for_scenario_simplepir(num_items: u64, item_size_bits: u64) -> Params {
     assert!(item_size_bits >= 2048 * 14);
 
@@ -175,49 +152,6 @@ impl GetQPrime for LWEParams {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct YPIRParams {
-    pub is_simplepir: bool,
-}
-
-pub trait GetRho {
-    fn rho(&self) -> usize;
-}
-
-impl GetRho for Params {
-    fn rho(&self) -> usize {
-        let lwe_params = LWEParams::default();
-        let lwe_q_prime_bits = lwe_params.q2_bits as usize;
-        let pt_bits = (self.pt_modulus as f64).log2().floor() as usize;
-        let blowup_factor = lwe_q_prime_bits as f64 / pt_bits as f64;
-        let smaller_params_db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
-            / self.poly_len as f64)
-            .log2()
-            .ceil() as usize;
-
-        let rho = 1 << smaller_params_db_dim_2;
-        rho
-    }
-}
-
-pub trait GetNumDbItems {
-    fn num_db_items(&self, is_simplepir: bool) -> usize;
-}
-
-impl GetNumDbItems for Params {
-    fn num_db_items(&self, is_simplepir: bool) -> usize {
-        if is_simplepir {
-            let db_rows = 1 << (self.db_dim_1 + self.poly_len_log2);
-            let db_cols = self.instances * self.poly_len;
-            db_rows * db_cols
-        } else {
-            let db_rows = 1 << (self.db_dim_1 + self.poly_len_log2);
-            let db_cols = 1 << (self.db_dim_2 + self.poly_len_log2);
-            db_rows * db_cols
-        }
-    }
-}
-
 pub trait PtModulusBits {
     fn pt_modulus_bits(&self) -> usize;
 }
@@ -230,9 +164,7 @@ impl PtModulusBits for Params {
 
 pub trait DbRowsCols {
     fn db_rows(&self) -> usize;
-    fn db_rows_padded_normal(&self) -> usize;
     fn db_rows_padded_simplepir(&self) -> usize;
-    fn db_cols_normal(&self) -> usize;
     fn db_cols_simplepir(&self) -> usize;
 }
 
@@ -241,19 +173,10 @@ impl DbRowsCols for Params {
         let db_rows = 1 << (self.db_dim_1 + self.poly_len_log2);
         db_rows
     }
-    fn db_rows_padded_normal(&self) -> usize {
-        let db_rows = 1 << (self.db_dim_1 + self.poly_len_log2);
-        db_rows + db_rows / 128
-    }
 
     fn db_rows_padded_simplepir(&self) -> usize {
         let db_rows = 1 << (self.db_dim_1 + self.poly_len_log2);
         db_rows
-    }
-
-    fn db_cols_normal(&self) -> usize {
-        let db_cols = 1 << (self.db_dim_2 + self.poly_len_log2);
-        db_cols
     }
 
     fn db_cols_simplepir(&self) -> usize {
