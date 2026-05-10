@@ -17,11 +17,8 @@ use ypir::server::*;
 struct Args {
     /// Number of items in the database
     num_items: usize,
-    /// Size of each item in bits (optional, default 1), values over 8 are unsupported
+    /// Size of each item in bits (optional, default 131072)
     item_size_bits: Option<usize>,
-    /// If set, run using SimplePIR instead of Double
-    #[clap(long, short, action)]
-    is_simplepir: bool,
     /// Port
     #[clap(long, short, default_value = "8080")]
     port: u16,
@@ -83,13 +80,8 @@ async fn main() -> std::io::Result<()> {
         hint_file,
         random,
         verbose,
-        is_simplepir,
         port,
     } = args;
-
-    if !is_simplepir {
-        panic!("Must use YPIR-SP for now.");
-    }
 
     if verbose {
         println!("Running in verbose mode.");
@@ -103,33 +95,22 @@ async fn main() -> std::io::Result<()> {
 
     let item_size_bits = item_size_bits.unwrap_or(16384 * 8);
 
-    if item_size_bits > 8 && !is_simplepir {
-        panic!("Items can be at must be at most 8 bits.");
-    } else if is_simplepir && item_size_bits < 2048 {
-        panic!("YPIR-SP requires items to be at least 2048 bits.");
+    if item_size_bits < 2048 * 14 {
+        panic!("YPIR-SP requires items to be at least 28672 bits.");
     }
 
     println!(
-        "Starting a YPIR ({}) server on a database of {} bits.",
-        if is_simplepir {
-            "w/ SimplePIR"
-        } else {
-            "w/ DoublePIR"
-        },
+        "Starting a YPIR-SP server on a database of {} bits.",
         num_items * item_size_bits,
     );
 
-    let params = if is_simplepir {
-        params_for_scenario_simplepir(num_items as u64, item_size_bits as u64)
-    } else {
-        params_for_scenario(num_items as u64, item_size_bits as u64)
-    };
+    let params = params_for_scenario_simplepir(num_items as u64, item_size_bits as u64);
     let pt_modulus = params.pt_modulus;
     let leaked_params = Box::leak(Box::new(params));
 
     let server = if random {
         let pt_iter = std::iter::repeat_with(|| (u16::sample() as u64 % pt_modulus) as u16);
-        YServer::<u16>::new(leaked_params, pt_iter, true, false, true)
+        YServer::<u16>::new(leaked_params, pt_iter, false, true)
     } else {
         assert!(inp_file.is_some());
         let inp_file = inp_file.unwrap();
@@ -140,7 +121,7 @@ async fn main() -> std::io::Result<()> {
             leaked_params.db_cols_simplepir(),
             pt_bits,
         );
-        YServer::<u16>::new(leaked_params, pt_iter, true, false, true)
+        YServer::<u16>::new(leaked_params, pt_iter, false, true)
     };
     println!("Performing precomputation...");
     let now = Instant::now();

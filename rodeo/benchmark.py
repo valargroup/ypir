@@ -10,14 +10,11 @@ def run_benchmark(
     scheme: str,
     num_items: int,
     item_size_bits: int,
-    num_clients: int,
     trials: int,
-    is_simplepir: bool,
 ):
     out_json_filename = "report.json"
-    sp_flag = "--is-simplepir" if is_simplepir else ""
 
-    cmd = f"./target/release-with-debug/run {num_items} {item_size_bits} {num_clients} {trials} {out_json_filename} {sp_flag}"
+    cmd = f"./target/release-with-debug/run {num_items} {item_size_bits} {trials} {out_json_filename}"
     print(cmd)
 
     # run commmand and get output
@@ -51,13 +48,7 @@ def run_benchmarks(scheme: str, trials: int, workload_file: str, output_json_fil
     for scenario in workload_json["workloads"]:
         num_items = int(scenario["db"]["numItems"])
         item_size_bits = int(scenario["db"]["itemSizeBits"])
-        num_clients = 1
-        if "clients" in scenario and "numClients" in scenario["clients"]:
-            num_clients = int(scenario["clients"]["numClients"])
-        is_simplepir = scheme == "ypir-simplepir"
-        measurement = run_benchmark(
-            scheme, num_items, item_size_bits, num_clients, trials, is_simplepir
-        )
+        measurement = run_benchmark(scheme, num_items, item_size_bits, trials)
         result = {"scenario": scenario, "measurement": measurement}
         results.append(result)
 

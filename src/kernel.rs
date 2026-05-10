@@ -400,9 +400,12 @@ where
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "huge_tests")]
     use std::time::Instant;
 
+    #[cfg(feature = "huge_tests")]
     use log::debug;
+    #[cfg(feature = "huge_tests")]
     use spiral_rs::aligned_memory::AlignedMemory64;
     use spiral_rs::poly::*;
 
@@ -411,6 +414,7 @@ mod test {
     use crate::{transpose::*, util::*};
     use test_log::test;
 
+    #[cfg(feature = "huge_tests")]
     fn test_fast_batched_dot_product(use_explicit: bool) {
         let params = test_params();
 
@@ -477,6 +481,7 @@ mod test {
 
     #[test]
     #[ignore]
+    #[cfg(feature = "huge_tests")]
     fn test_fast_batched_dot_product_implicit() {
         test_fast_batched_dot_product(false);
     }
@@ -484,8 +489,14 @@ mod test {
     #[test]
     fn test_negacyclic_mul_db_col() {
         let params = test_params();
-        let pol_a = PolyMatrixRaw::random(&params, 1, 1);
-        let pol_b: PolyMatrixRaw<'_> = PolyMatrixRaw::random(&params, 1, 1);
+        let mut pol_a = PolyMatrixRaw::zero(&params, 1, 1);
+        let mut pol_b = PolyMatrixRaw::zero(&params, 1, 1);
+        for x in pol_a.as_mut_slice() {
+            *x = fastrand::u64(..params.pt_modulus);
+        }
+        for x in pol_b.as_mut_slice() {
+            *x = fastrand::u64(..params.pt_modulus);
+        }
         let a = pol_a.get_poly(0, 0);
         let b = pol_b.get_poly(0, 0);
         let negacylic_a = negacyclic_matrix(&a, params.modulus);
@@ -530,8 +541,14 @@ mod test {
     #[test]
     fn test_negacyclic_mul() {
         let params = test_params();
-        let pol_a = PolyMatrixRaw::random(&params, 1, 1);
-        let pol_b = PolyMatrixRaw::random(&params, 1, 1);
+        let mut pol_a = PolyMatrixRaw::zero(&params, 1, 1);
+        let mut pol_b = PolyMatrixRaw::zero(&params, 1, 1);
+        for x in pol_a.as_mut_slice() {
+            *x = fastrand::u64(..params.pt_modulus);
+        }
+        for x in pol_b.as_mut_slice() {
+            *x = fastrand::u64(..params.pt_modulus);
+        }
         let a = pol_a.get_poly(0, 0);
         let b = pol_b.get_poly(0, 0);
         let negacylic_a = negacyclic_matrix(&a, params.modulus);

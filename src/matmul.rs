@@ -68,12 +68,15 @@ pub fn matmul_vec_packed(
 
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "huge_tests")]
     use std::time::Instant;
 
+    #[cfg(feature = "huge_tests")]
     use super::*;
 
     #[test]
     #[ignore]
+    #[cfg(feature = "huge_tests")]
     fn test_matmul_vec_packed() {
         let a_rows = 32768;
         let a_cols = 8192;
@@ -102,6 +105,7 @@ mod test {
 
     #[test]
     #[ignore]
+    #[cfg(feature = "huge_tests")]
     fn test_matmul_vec_packed_8() {
         // 32 GB:
         // matmul_vec_packed: a_rows: 131072, a_cols: 65536, b_rows: 262144, b_cols: 8

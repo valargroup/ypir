@@ -14,7 +14,7 @@ Our benchmarks were collected using the AWS `r6i.16xlarge` instance type, which 
   - Select `1) Proceed with installation (default)` when prompted
   - After installation, configure the current shell as instructed by running `source "$HOME/.cargo/env"`
 3. Run `git clone https://github.com/menonsamir/ypir.git` and `cd ypir`.
-4. Run `cargo run --release -- 1073741824` to run YPIR on a random database consisting of 1073741824 bits (~134 MB).
+4. Run `cargo run --release -- 32768 131072` to run YPIR-SP on a random database of 32768 items, each 131072 bits.
 The first time you run this command, Cargo will download and install the necessary libraries to build the code (~2 minutes);
 later calls will not take as long. Stability warnings can be safely ignored. 
 See below for details on how to interpret the measurements.
@@ -134,7 +134,7 @@ You can run YPIR as a standalone HTTP server using a command like:
 
 
 ```sh
-$ RUST_LOG=debug cargo run --profile release-with-debug --bin server 32768 262144 --is-simplepir --inp-file ../passwords-data/hibp-passwords.bin -p 8989 --hint-file ../passwords-data/hibp-passwords-2-hint.bin
+$ RUST_LOG=debug cargo run --profile release-with-debug --bin server 32768 262144 --inp-file ../passwords-data/hibp-passwords.bin -p 8989 --hint-file ../passwords-data/hibp-passwords-2-hint.bin
 ```
 
 
