@@ -13,7 +13,7 @@ use ypir::serialize::ToBytes;
 struct Args {
     /// Number of items in the database
     num_items: usize,
-    /// Size of each item in bits (optional, default 1), values over 8 are unsupported
+    /// Size of each item in bits
     item_size_bits: usize,
     /// Row to fetch
     #[clap(long)]
@@ -21,9 +21,6 @@ struct Args {
     /// Item to check for inclusion
     #[clap(long)]
     target_item: Option<String>,
-    /// If set, run using SimplePIR instead of Double
-    #[clap(long, short, action)]
-    is_simplepir: bool,
     /// Port
     #[clap(long, short, default_value = "8080")]
     port: u16,
@@ -43,7 +40,6 @@ fn main() {
         num_items,
         item_size_bits,
         verbose,
-        is_simplepir,
         port,
     } = args;
 
@@ -63,10 +59,6 @@ fn main() {
         (bucket as usize, Some(item_hash))
     };
 
-    if !is_simplepir {
-        panic!("Must use YPIR-SP for now.");
-    }
-
     if verbose {
         println!("Running in verbose mode.");
         env_logger::Builder::new()
@@ -77,7 +69,7 @@ fn main() {
         env_logger::init();
     }
 
-    let client = YPIRClient::from_db_sz(num_items as u64, item_size_bits as u64, is_simplepir);
+    let client = YPIRClient::from_db_sz(num_items as u64, item_size_bits as u64);
     assert!(target_row < client.params().db_rows());
 
     let (query, client_seed) = client.generate_query_simplepir(target_row);

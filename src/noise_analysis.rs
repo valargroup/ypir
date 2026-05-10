@@ -6,7 +6,7 @@ use spiral_rs::{arith::rescale, client::Client, params::Params, poly::*};
 
 use super::{
     lwe::LWEParams,
-    params::{params_for_scenario, GetQPrime},
+    params::{params_for_scenario_simplepir, GetQPrime},
 };
 
 /*
@@ -122,9 +122,8 @@ pub struct YPIRSchemeParams {
 
 impl Default for YPIRSchemeParams {
     fn default() -> Self {
-        let max_db_bits = 64 * (1 << 33); // 64 GB
         let lwe_params = LWEParams::default();
-        let params = params_for_scenario(max_db_bits, 1);
+        let params = params_for_scenario_simplepir(1 << 14, 2048 * 14);
         Self::from_params(&params, &lwe_params)
     }
 }
@@ -240,8 +239,10 @@ pub fn measure_noise_width_squared<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "huge_tests")]
     use spiral_rs::arith::barrett_reduction_u128;
 
+    #[cfg(feature = "huge_tests")]
     use super::super::{
         client::{decrypt_ct_reg_measured, YClient},
         constants::*,
@@ -276,6 +277,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[cfg(feature = "huge_tests")]
     fn test_linear_accumulation_noise() {
         let params = params_for_scenario(1 << 43, 1);
         let upper_n = 1 << (11 + 6);
