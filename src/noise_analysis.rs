@@ -2,7 +2,8 @@ use std::f64::consts::PI;
 
 use log::debug;
 
-use spiral_rs::{arith::rescale, client::Client, params::Params, poly::*};
+use serde::Serialize;
+use spiral_rs::{arith::rescale, client::Client, gadget::get_bits_per, params::Params, poly::*};
 
 use super::{
     lwe::LWEParams,
@@ -62,6 +63,10 @@ fn delta_double(
     let sigma_2 = sigma_2_double(d_2, q_2, qtilde_2_2, qtilde_2_1, sigma_2, p, z, l_2);
     let delta = 2.0 * (-PI * tau.powi(2) / sigma_2).exp();
     (delta, sigma_2)
+}
+
+fn log2_delta(tau: f64, sigma_2: f64) -> f64 {
+    1.0 - PI * tau.powi(2) / (sigma_2 * std::f64::consts::LN_2)
 }
 
 fn tau_simple(q_1: f64, qtilde_1: f64, n: f64) -> f64 {
@@ -166,7 +171,14 @@ impl YPIRSchemeParams {
 
     /// Returns the gadget decomposition base, z in the paper. In the implementation, we just set t = 3.
     pub fn z(&self) -> f64 {
-        2.0f64.powf(self.q2.log2().ceil() / self.t).ceil()
+        let modulus_log2 = self.q2.log2().ceil() as usize;
+        let t = self.t as usize;
+        let bits_per = if t == modulus_log2 {
+            1
+        } else {
+            modulus_log2 / t + 1
+        };
+        (1u64 << bits_per) as f64
     }
 
     pub fn delta_simple(&self) -> (f64, f64) {
@@ -199,6 +211,55 @@ impl YPIRSchemeParams {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YPIRSPNoiseReport {
+    pub poly_len: usize,
+    pub instances: usize,
+    pub gadget_digits: usize,
+    pub gadget_bits_per_digit: usize,
+    pub gadget_base: u64,
+    pub modeled_noise_width_squared: f64,
+    pub modeled_failure_log2: f64,
+}
+
+/// Evaluates the analytical packing-noise bound for YPIR+SimplePIR.
+///
+/// This uses the production gadget decomposition and the SimplePIR database
+/// width (`instances * poly_len`) rather than the two-dimensional YPIR shape.
+pub fn ypir_sp_noise_report(params: &Params) -> YPIRSPNoiseReport {
+    let q = params.modulus as f64;
+    let q_prime_large = params.get_q_prime_2() as f64;
+    let q_prime_small = params.get_q_prime_1() as f64;
+    let d = params.poly_len as f64;
+    let l = (params.instances * params.poly_len) as f64;
+    let p = params.pt_modulus as f64;
+    let gadget_bits_per_digit = get_bits_per(params, params.t_exp_left);
+    let gadget_base = 1u64 << gadget_bits_per_digit;
+
+    let tau = tau_double(q, q_prime_small, p);
+    let modeled_noise_width_squared = sigma_2_double(
+        d,
+        q,
+        q_prime_small,
+        q_prime_large,
+        params.noise_width,
+        p,
+        gadget_base as f64,
+        l,
+    );
+
+    YPIRSPNoiseReport {
+        poly_len: params.poly_len,
+        instances: params.instances,
+        gadget_digits: params.t_exp_left,
+        gadget_bits_per_digit,
+        gadget_base,
+        modeled_noise_width_squared,
+        modeled_failure_log2: log2_delta(tau, modeled_noise_width_squared),
+    }
+}
+
 pub fn measure_noise_width_squared<'a>(
     params: &Params,
     client: &Client<'a>,
@@ -206,8 +267,10 @@ pub fn measure_noise_width_squared<'a>(
     pt: &PolyMatrixRaw<'a>,
     coeffs_to_measure: usize,
 ) -> f64 {
-    let m_i64 = params.modulus as i64;
+    assert!(coeffs_to_measure > 0);
     let dec_result = client.decrypt_matrix_reg(ct).raw();
+    assert!(coeffs_to_measure <= dec_result.data.len());
+    assert!(coeffs_to_measure <= pt.data.len());
     let mut total = 0f64;
     for i in 0..coeffs_to_measure {
         // let decrypted_val = wrapped(dec_result.data[i], params.modulus);
@@ -215,11 +278,11 @@ pub fn measure_noise_width_squared<'a>(
         //     rescale(pt.data[i], params.pt_modulus, params.modulus),
         //     params.modulus,
         // );
-        let decrypted_val = dec_result.data[i] as i64;
-        let true_val = rescale(pt.data[i], params.pt_modulus, params.modulus) as i64;
-        let diff = decrypted_val - true_val;
-        let diff_mod = diff.min(m_i64 - diff);
-        let noise_2 = (diff_mod as f64).powi(2);
+        let decrypted_val = dec_result.data[i];
+        let true_val = rescale(pt.data[i], params.pt_modulus, params.modulus);
+        let diff = decrypted_val.abs_diff(true_val);
+        let centered_diff = diff.min(params.modulus - diff);
+        let noise_2 = (centered_diff as f64).powi(2);
         assert!(noise_2 >= 0.0);
         // if noise_2.log2() >= 77.0 {
         //     debug!(
@@ -229,7 +292,7 @@ pub fn measure_noise_width_squared<'a>(
         // }
         total += noise_2;
     }
-    let variance = total / params.poly_len as f64;
+    let variance = total / coeffs_to_measure as f64;
     assert!(variance >= 0.0);
 
     // noise_standard_deviation * sqrt(2*pi) == subg_width
@@ -241,6 +304,7 @@ pub fn measure_noise_width_squared<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params::{params_for_scenario_simplepir_with_config, YPIRSPConfig};
 
     #[test]
     fn test_new_calc() {
@@ -259,12 +323,25 @@ mod tests {
     }
 
     #[test]
-    fn test_ypir_scheme_params() {
-        let ysp = YPIRSchemeParams::default();
+    fn test_ypir_sp_noise_reports_match_gadget_configuration() {
+        let params_2048 = params_for_scenario_simplepir_with_config(
+            1 << 14,
+            1 << 17,
+            YPIRSPConfig::degree_2048(),
+        );
+        let params_4096 = params_for_scenario_simplepir_with_config(
+            1 << 14,
+            1 << 17,
+            YPIRSPConfig::degree_4096(),
+        );
+        let report_2048 = ypir_sp_noise_report(&params_2048);
+        let report_4096 = ypir_sp_noise_report(&params_4096);
 
-        let total_log2_delta = ysp.delta().log2();
-        debug!("total_log2_delta: {}", total_log2_delta);
-
-        assert!(total_log2_delta < -40.);
+        assert_eq!(report_2048.gadget_bits_per_digit, 19);
+        assert_eq!(report_2048.gadget_base, 1 << 19);
+        assert_eq!(report_4096.gadget_bits_per_digit, 15);
+        assert_eq!(report_4096.gadget_base, 1 << 15);
+        assert!(report_2048.modeled_failure_log2 < -40.0);
+        assert!(report_4096.modeled_failure_log2 < -40.0);
     }
 }

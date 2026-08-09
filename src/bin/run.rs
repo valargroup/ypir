@@ -1,5 +1,5 @@
 #[cfg(feature = "server")]
-use valar_ypir::scheme::run_ypir_batched;
+use valar_ypir::{params::YPIRSPConfig, scheme::run_ypir_batched_with_sp_config};
 
 use clap::Parser;
 
@@ -21,6 +21,9 @@ struct Args {
     /// if set, run as SimplePIR
     #[clap(long, short, action)]
     is_simplepir: bool,
+    /// RLWE polynomial degree for YPIR-SP (2048 or 4096)
+    #[clap(long, default_value_t = 2048)]
+    poly_len: usize,
     /// Output report file (optional)
     /// where results will be written in JSON.
     out_report_json: Option<String>,
@@ -41,6 +44,7 @@ fn main() {
         out_report_json,
         verbose,
         is_simplepir,
+        poly_len,
     } = args;
 
     if verbose {
@@ -74,8 +78,14 @@ fn main() {
         trials
     );
 
-    let measurement =
-        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials);
+    let measurement = run_ypir_batched_with_sp_config(
+        num_items,
+        item_size_bits,
+        num_clients,
+        is_simplepir,
+        trials,
+        YPIRSPConfig::for_poly_len(poly_len),
+    );
     println!(
         "Measurement completed. See the README for details on what the following fields mean."
     );

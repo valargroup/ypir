@@ -17,8 +17,30 @@ pub fn run_ypir_batched(
     is_simplepir: bool,
     trials: usize,
 ) -> Measurement {
+    run_ypir_batched_with_sp_config(
+        num_items,
+        item_size_bits,
+        num_clients,
+        is_simplepir,
+        trials,
+        YPIRSPConfig::default(),
+    )
+}
+
+pub fn run_ypir_batched_with_sp_config(
+    num_items: usize,
+    item_size_bits: usize,
+    num_clients: usize,
+    is_simplepir: bool,
+    trials: usize,
+    sp_config: YPIRSPConfig,
+) -> Measurement {
     let params = if is_simplepir {
-        params_for_scenario_simplepir(num_items as u64, item_size_bits as u64)
+        params_for_scenario_simplepir_with_config(
+            num_items as u64,
+            item_size_bits as u64,
+            sp_config,
+        )
     } else {
         params_for_scenario(num_items as u64, item_size_bits as u64)
     };

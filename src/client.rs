@@ -629,6 +629,19 @@ impl YPIRClient {
         Self::new(&params)
     }
 
+    /// Constructs a YPIR+SimplePIR client with an explicit ring configuration.
+    ///
+    /// The server processing this client's queries must use the same config.
+    pub fn from_db_sz_simplepir_with_config(
+        num_items: u64,
+        item_size_bits: u64,
+        config: YPIRSPConfig,
+    ) -> Self {
+        let params =
+            params_for_scenario_simplepir_with_config(num_items, item_size_bits, config);
+        Self::new(&params)
+    }
+
     pub fn generate_query_normal(&self, target_idx: usize) -> (YPIRQuery, Seed) {
         let client_seed = generate_secure_random_seed();
         let mut client = Client::init(&self.params);
@@ -817,6 +830,24 @@ mod test {
         let pt_dec = client.decrypt(&ct);
         let result = rescale(pt_dec as u64, lwe_params.modulus, lwe_params.pt_modulus) as u32;
         assert_eq!(result, pt);
+    }
+
+    #[test]
+    fn test_generate_simplepir_query_at_4096() {
+        let client = YPIRClient::from_db_sz_simplepir_with_config(
+            512,
+            32_768,
+            YPIRSPConfig::degree_4096(),
+        );
+        let ((query_row, packing_keys), _) = client.generate_query_simplepir(7);
+        let params = client.params();
+
+        assert_eq!(params.poly_len, 4096);
+        assert_eq!(query_row.len(), params.db_rows());
+        assert_eq!(
+            packing_keys.len(),
+            params.poly_len_log2 * params.t_exp_left * params.poly_len
+        );
     }
 
     #[test]

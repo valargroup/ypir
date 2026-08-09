@@ -47,6 +47,32 @@ Options:
   -V, --version  Print version
 ```
 
+### YPIR-SP ring dimension
+
+YPIR-SP defaults to the audited 2048-degree parameter set. The experimental
+4096-degree set can be selected with `--poly-len 4096` on the `run`, `client`,
+and `server` binaries. Clients and servers must select the same degree.
+
+Library callers can select it explicitly:
+
+```rust
+use valar_ypir::{client::YPIRClient, params::YPIRSPConfig};
+
+let client = YPIRClient::from_db_sz_simplepir_with_config(
+    num_items,
+    item_size_bits,
+    YPIRSPConfig::degree_4096(),
+);
+```
+
+The 4096 preset uses four gadget digits to control packing noise. Print the
+resolved cryptographic parameters and analytical noise bound with:
+
+```sh
+cargo run --features cli --bin analyze-sp -- \
+  <NUM_ITEMS> <ITEM_SIZE_BITS> --poly-len 4096
+```
+
 ### Interpreting measurements
 This is an annotated version of the output
 of running `RUST_LOG=debug cargo run --profile release-with-debug --bin server 8589934592 1` 

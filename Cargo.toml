@@ -65,6 +65,11 @@ name = "run"
 path = "src/bin/run.rs"
 required-features = ["server", "cli"]
 
+[[bin]]
+name = "analyze-sp"
+path = "src/bin/analyze-sp.rs"
+required-features = ["cli"]
+
 
 # [profile.release]
 # lto = "fat"

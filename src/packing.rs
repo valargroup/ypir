@@ -695,7 +695,7 @@ pub fn fast_multiply_no_reduce(
     assert_eq!(res.cols, 1);
 
     assert_eq!(a.cols, b.rows);
-    assert_eq!(params.crt_count * params.poly_len, 2 * 2048);
+    assert_eq!(params.crt_count, 2);
 
     unsafe {
         let a_ptr = a.as_slice().as_ptr();
@@ -746,7 +746,7 @@ pub fn fast_multiply_no_reduce(
     assert_eq!(res.cols, 1);
 
     assert_eq!(a.cols, b.rows);
-    assert_eq!(params.crt_count * params.poly_len, 2 * 2048);
+    assert_eq!(params.crt_count, 2);
 
     unsafe {
         let a_ptr = a.as_slice().as_ptr();
@@ -1275,6 +1275,22 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn test_fast_multiply_no_reduce_at_4096() {
+        let params = crate::params::params_for_scenario_simplepir_with_config(
+            512,
+            32_768,
+            crate::params::YPIRSPConfig::degree_4096(),
+        );
+        let a = PolyMatrixNTT::zero(&params, 1, 1);
+        let b = PolyMatrixNTT::zero(&params, 1, 1);
+        let mut result = PolyMatrixNTT::zero(&params, 1, 1);
+
+        fast_multiply_no_reduce(&params, &mut result, &a, &b, 0);
+
+        assert!(result.as_slice().iter().all(|value| *value == 0));
+    }
 
     #[test]
     fn test_packing() {
