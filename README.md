@@ -73,6 +73,14 @@ cargo run --features cli --bin analyze-sp -- \
   <NUM_ITEMS> <ITEM_SIZE_BITS> --poly-len 4096
 ```
 
+This command reports the YPIR-SP path only. The same correction that aligns
+the model with the production gadget base (`2^19` for three digits) changes
+the existing 2048-degree YPIR-double model from approximately `2^-41.75` to
+`2^-26.74` total failure probability (`2^-96.70` for the SimplePIR stage and
+`2^-26.74` for the double-PIR stage). That is below the previous `2^-40`
+target and is tracked by a regression test; it does not affect the YPIR-SP
+bounds.
+
 ### Interpreting measurements
 This is an annotated version of the output
 of running `RUST_LOG=debug cargo run --profile release-with-debug --bin server 8589934592 1` 

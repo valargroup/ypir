@@ -323,6 +323,35 @@ mod tests {
     }
 
     #[test]
+    fn test_ypir_scheme_params() {
+        let ysp = YPIRSchemeParams::default();
+        let simple_log2_delta = ysp.delta_simple().0.log2();
+        let double_log2_delta = ysp.delta_double().0.log2();
+        let total_log2_delta = ysp.delta().log2();
+
+        // Using the production gadget base (2^19) exposes that the existing
+        // YPIR-double parameters do not meet the previous 2^-40 target. Keep
+        // this characterization explicit rather than silently dropping the
+        // two-dimensional path's regression coverage.
+        assert!(
+            (simple_log2_delta - -96.70).abs() < 0.05,
+            "simple_log2_delta: {simple_log2_delta}"
+        );
+        assert!(
+            (double_log2_delta - -26.74).abs() < 0.05,
+            "double_log2_delta: {double_log2_delta}"
+        );
+        assert!(
+            (total_log2_delta - -26.74).abs() < 0.05,
+            "total_log2_delta: {total_log2_delta}"
+        );
+        assert!(
+            total_log2_delta > -40.0,
+            "update this characterization if the default parameters are strengthened"
+        );
+    }
+
+    #[test]
     fn test_ypir_sp_noise_reports_match_gadget_configuration() {
         let params_2048 = params_for_scenario_simplepir_with_config(
             1 << 14,
