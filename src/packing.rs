@@ -448,6 +448,7 @@ pub fn pack_using_precomp_vals<'a>(
 
     let mut idx_precomp = 0;
     let mut num_muls = 0;
+    let reduction_interval = safe_packing_reduction_interval(params);
     for cur_ell in 1..=ell {
         let mut num_in = 1 << (ell - cur_ell + 1);
         let num_out = num_in >> 1;
@@ -506,8 +507,9 @@ pub fn pack_using_precomp_vals<'a>(
                 time_3 += now.elapsed().as_micros();
                 let now = Instant::now();
 
-                // second condition prevents overflow
-                if i < num_out / 2 && ((cur_ell - 1) % 5 != 0) {
+                // The second condition reduces before the unreduced accumulator
+                // can exceed u64 for this parameter set.
+                if i < num_out / 2 && ((cur_ell - 1) % reduction_interval != 0) {
                     fast_add_into_no_reduce(ct_even, &w_times_ginv_ct);
                 } else {
                     // reduction right before or after addition is much faster than at multiplication time
@@ -582,6 +584,52 @@ pub fn pack_using_precomp_vals<'a>(
     // }
 
     out
+}
+
+/// Returns the longest safe interval between reductions in the optimized
+/// packing accumulator.
+///
+/// If every CRT lane is canonical, its worst-case coefficient follows
+/// `M_1 = t*q^2` and `M_{l+1} = 2*M_l + (2+t)*q^2`. Work with the coefficient
+/// of `q^2` in `u128` so parameter changes cannot silently invalidate the
+/// overflow budget.
+fn safe_packing_reduction_interval(params: &Params) -> usize {
+    let t = params.t_exp_left as u128;
+    assert!(t > 0, "t_exp_left must be non-zero");
+
+    let q = params
+        .moduli
+        .iter()
+        .copied()
+        .max()
+        .expect("packing requires at least one CRT modulus") as u128;
+    let q_squared = q * q;
+    let max_coefficient = (u64::MAX as u128) / q_squared;
+
+    let mut peak_coefficient = t;
+    assert!(
+        peak_coefficient <= max_coefficient,
+        "packing accumulator cannot hold even one level"
+    );
+
+    let mut interval = 0;
+    loop {
+        let next_peak = peak_coefficient
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(2 + t))
+            .unwrap_or(u128::MAX);
+        if next_peak > max_coefficient {
+            break;
+        }
+        peak_coefficient = next_peak;
+        interval += 1;
+    }
+
+    // At loop exit, peak_coefficient is M_{1+interval}. Thus, for a nonzero
+    // interval, `(cur_ell - 1) % interval == 0` reduces exactly when that
+    // largest safe peak is reached; using `interval + 1` would allow one
+    // unsafe recurrence step. Zero means only M_1 fits, so reduce every level.
+    interval.max(1)
 }
 
 pub fn pack_single_lwe<'a>(
@@ -1270,11 +1318,37 @@ mod test {
     use spiral_rs::{client::Client, number_theory::invert_uint_mod, util::get_test_params};
 
     use crate::{
-        client::raw_generate_expansion_params, params::params_for_scenario,
+        client::raw_generate_expansion_params,
+        params::{params_for_scenario, params_for_scenario_simplepir_with_config, YPIRSPConfig},
         server::generate_y_constants,
     };
 
     use super::*;
+
+    #[test]
+    fn test_safe_packing_reduction_intervals() {
+        let params_2048 = params_for_scenario_simplepir_with_config(
+            2048,
+            2048 * 14,
+            YPIRSPConfig::degree_2048(),
+        );
+        let params_4096 = params_for_scenario_simplepir_with_config(
+            4096,
+            4096 * 14,
+            YPIRSPConfig::degree_4096(),
+        );
+
+        assert_eq!(safe_packing_reduction_interval(&params_2048), 5);
+        assert_eq!(safe_packing_reduction_interval(&params_4096), 4);
+
+        let q = *params_4096.moduli.iter().max().unwrap() as u128;
+        let mut reduce_every_level = params_4096.clone();
+        reduce_every_level.t_exp_left = ((u64::MAX as u128) / (q * q)) as usize;
+        assert_eq!(
+            safe_packing_reduction_interval(&reduce_every_level),
+            1
+        );
+    }
 
     #[test]
     fn test_fast_multiply_no_reduce_at_4096() {

@@ -1152,6 +1152,13 @@ pub fn unpack_vec_pm<'a>(
     data: &[u64],
 ) -> Vec<PolyMatrixNTT<'a>> {
     assert_eq!(params.crt_count, 2);
+    assert!(
+        params
+            .moduli
+            .iter()
+            .all(|&modulus| modulus <= u32::MAX as u64),
+        "condensed CRT limbs require 32-bit moduli"
+    );
     let mut v_cts = Vec::with_capacity(data.len() / (rows * cols * params.poly_len));
     let mut iter = data.chunks_exact(rows * cols * params.poly_len);
     for _ in 0..v_cts.capacity() {
@@ -1163,7 +1170,16 @@ pub fn unpack_vec_pm<'a>(
                 let in_offs = (row * cols + col) * params.poly_len;
                 let out_offs = (row * cols + col) * 2 * params.poly_len;
                 for z in 0..params.poly_len {
-                    ct.data[out_offs + z] = in_data[in_offs + z];
+                    let packed = in_data[in_offs + z];
+                    let mut low = packed as u32 as u64;
+                    let mut high = packed >> 32;
+                    if low >= params.moduli[0] {
+                        low %= params.moduli[0];
+                    }
+                    if high >= params.moduli[1] {
+                        high %= params.moduli[1];
+                    }
+                    ct.data[out_offs + z] = low | (high << 32);
                 }
             }
         }
@@ -1333,6 +1349,19 @@ mod test {
         for (ct1, ct2) in v_cts.iter().zip(v_cts2.iter()) {
             assert_eq!(ct1.raw().as_slice(), ct2.raw().as_slice());
         }
+    }
+
+    #[test]
+    fn test_unpack_vec_pm_canonicalizes_crt_limbs() {
+        let params = params_for_scenario(1 << 10, 1);
+        let mut data = vec![0; params.poly_len];
+        data[0] = (params.moduli[0] + 7) | ((params.moduli[1] + 11) << 32);
+
+        let packed = unpack_vec_pm(&params, 1, 1, &data);
+        let unpacked = uncondense_matrix(&params, &packed[0]);
+
+        assert_eq!(unpacked.data[0], 7);
+        assert_eq!(unpacked.data[params.poly_len], 11);
     }
 
     #[test]
