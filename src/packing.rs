@@ -1351,22 +1351,6 @@ mod test {
     }
 
     #[test]
-    fn test_fast_multiply_no_reduce_at_4096() {
-        let params = crate::params::params_for_scenario_simplepir_with_config(
-            512,
-            32_768,
-            crate::params::YPIRSPConfig::degree_4096(),
-        );
-        let a = PolyMatrixNTT::zero(&params, 1, 1);
-        let b = PolyMatrixNTT::zero(&params, 1, 1);
-        let mut result = PolyMatrixNTT::zero(&params, 1, 1);
-
-        fast_multiply_no_reduce(&params, &mut result, &a, &b, 0);
-
-        assert!(result.as_slice().iter().all(|value| *value == 0));
-    }
-
-    #[test]
     fn test_packing() {
         let params = get_test_params();
         let mut client = Client::init(&params);

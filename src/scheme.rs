@@ -522,6 +522,18 @@ mod test {
     }
 
     #[test]
+    fn test_ypir_simplepir_degree_4096() {
+        run_ypir_batched_with_sp_config(
+            4096,
+            4096 * 14,
+            1,
+            true,
+            1,
+            YPIRSPConfig::degree_4096(),
+        );
+    }
+
+    #[test]
     fn test_ypirclient() {
         let params = params_for_scenario(1 << 30, 1);
         let pt_iter = std::iter::repeat_with(|| u8::sample());
