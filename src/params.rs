@@ -61,6 +61,40 @@ impl YPIRSPConfig {
     }
 }
 
+/// Recovers the `YPIRSPConfig` that a `Params` encodes, or `None` if its
+/// `(poly_len, t_exp_left)` pair is not a supported YPIR-SP set.
+///
+/// `YPIRSPConfig`'s fields are private, so a mismatched pair cannot be
+/// constructed from outside this crate. But `Params` carries `poly_len` and
+/// `t_exp_left` as public fields and can be mutated after construction, so
+/// code that accepts a bare `&Params` does not inherit that guarantee. This is
+/// how such code re-establishes it.
+pub fn ypir_sp_config_of(params: &Params) -> Option<YPIRSPConfig> {
+    match (params.poly_len, params.t_exp_left) {
+        (2048, 3) => Some(YPIRSPConfig::degree_2048()),
+        (4096, 4) => Some(YPIRSPConfig::degree_4096()),
+        _ => None,
+    }
+}
+
+/// Panics unless `params` carries a supported YPIR-SP `(poly_len, t_exp_left)`
+/// pair.
+///
+/// The gadget base is derived from `t_exp_left` (`get_bits_per`), the packing
+/// reduction cadence is derived from both, and the noise bound in
+/// `noise_analysis` is only validated for these pairs. Calling this at the
+/// boundary where a `&Params` first enters the YPIR-SP path keeps every
+/// downstream derivation on ground that has actually been checked.
+pub fn assert_valid_ypir_sp_params(params: &Params) {
+    assert!(
+        ypir_sp_config_of(params).is_some(),
+        "unsupported YPIR-SP parameters (poly_len={}, t_exp_left={}): expected \
+         (2048, 3) or (4096, 4)",
+        params.poly_len,
+        params.t_exp_left
+    );
+}
+
 impl Default for YPIRSPConfig {
     fn default() -> Self {
         Self::degree_2048()

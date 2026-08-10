@@ -166,6 +166,12 @@ where
     where
         I: Iterator<Item = T>,
     {
+        if is_simplepir {
+            // `Params` exposes poly_len / t_exp_left publicly, so re-check the
+            // pair here rather than trusting that it came from a YPIRSPConfig.
+            assert_valid_ypir_sp_params(params);
+        }
+
         // TODO: hack
         // let lwe_params = LWEParams::default();
         let mut ypir_params = YPIRParams::default();
