@@ -956,7 +956,12 @@ mod malformed_response_tests {
         assert_eq!(result.len(), db_cols);
     }
 
+    // The u128 accumulator only *panics* on overflow when overflow checks are
+    // compiled in; in a release build it wraps silently. Gating on
+    // `debug_assertions` keeps `cargo test --release` green, which matters
+    // because a suite that is red by default hides real regressions.
     #[test]
+    #[cfg(debug_assertions)]
     fn decode_response_u64_max_overflows_accumulator() {
         let params = make_test_params();
         let (mut client, seed) = make_yclient_from_seed(&params, fixed_seed());
