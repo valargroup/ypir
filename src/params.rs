@@ -16,8 +16,8 @@ pub const DEFAULT_POLY_LEN: usize = 2048;
 /// packing noise introduced by the larger ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct YPIRSPConfig {
-    pub poly_len: usize,
-    pub t_exp_left: usize,
+    poly_len: usize,
+    t_exp_left: usize,
 }
 
 impl YPIRSPConfig {
@@ -41,6 +41,23 @@ impl YPIRSPConfig {
             4096 => Self::degree_4096(),
             _ => panic!("YPIR-SP poly_len must be 2048 or 4096"),
         }
+    }
+
+    pub const fn poly_len(self) -> usize {
+        self.poly_len
+    }
+
+    pub const fn t_exp_left(self) -> usize {
+        self.t_exp_left
+    }
+
+    fn validated_values(self) -> (usize, usize) {
+        assert!(
+            matches!((self.poly_len, self.t_exp_left), (2048, 3) | (4096, 4)),
+            "YPIR-SP configuration must be (poly_len=2048, t_exp_left=3) or \
+             (poly_len=4096, t_exp_left=4)"
+        );
+        (self.poly_len, self.t_exp_left)
     }
 }
 
@@ -182,33 +199,21 @@ pub fn params_for_scenario_simplepir_with_config(
 ) -> Params {
     assert!(num_items > 0, "YPIR-SP requires at least one item");
     assert!(item_size_bits > 0, "YPIR-SP items must not be empty");
-    assert!(
-        matches!(config.poly_len, 2048 | 4096),
-        "YPIR-SP poly_len must be 2048 or 4096"
-    );
-    assert!(config.t_exp_left > 0, "t_exp_left must be non-zero");
+    let (poly_len, t_exp_left) = config.validated_values();
 
-    let padded_rows = num_items.next_power_of_two().max(config.poly_len as u64);
-    let bits_per_instance = config.poly_len as u64 * 14;
+    let padded_rows = num_items.next_power_of_two().max(poly_len as u64);
+    let bits_per_instance = poly_len as u64 * 14;
     let db_cols = item_size_bits.div_ceil(bits_per_instance) as usize;
 
     debug!("db_rows: {}, db_cols: {}", padded_rows, db_cols);
 
-    let nu_1 = padded_rows.trailing_zeros() as usize - config.poly_len.trailing_zeros() as usize;
+    let nu_1 = padded_rows.trailing_zeros() as usize - poly_len.trailing_zeros() as usize;
     debug!("chose nu_1: {}", nu_1);
 
     let p = 1 << 14;
     let q2_bits = 28;
 
-    let mut params = internal_params_for(
-        nu_1,
-        1,
-        p,
-        q2_bits,
-        config.t_exp_left,
-        DEF_MOD_STR,
-        config.poly_len,
-    );
+    let mut params = internal_params_for(nu_1, 1, p, q2_bits, t_exp_left, DEF_MOD_STR, poly_len);
     params.instances = db_cols;
     params
 }
@@ -368,5 +373,18 @@ mod tests {
     #[should_panic(expected = "YPIR-SP poly_len must be 2048 or 4096")]
     fn unsupported_simplepir_degree_is_rejected() {
         let _ = YPIRSPConfig::for_poly_len(1024);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "YPIR-SP configuration must be (poly_len=2048, t_exp_left=3) or (poly_len=4096, t_exp_left=4)"
+    )]
+    fn mismatched_simplepir_degree_and_gadget_digits_are_rejected() {
+        let invalid = YPIRSPConfig {
+            poly_len: 4096,
+            t_exp_left: 3,
+        };
+
+        let _ = params_for_scenario_simplepir_with_config(512, 32_768, invalid);
     }
 }
