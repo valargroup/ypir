@@ -7,7 +7,7 @@ use spiral_rs::{arith::rescale, client::Client, gadget::get_bits_per, params::Pa
 
 use super::{
     lwe::LWEParams,
-    params::{params_for_scenario, GetQPrime},
+    params::{assert_valid_ypir_sp_params, params_for_scenario, DbRowsCols, GetQPrime},
 };
 
 /*
@@ -211,52 +211,127 @@ impl YPIRSchemeParams {
     }
 }
 
+/// Multiplicative slack on the analytical automorphism-packing term.
+///
+/// The `(d^2 - 1)(t*d*z^2)/3` expression is the YPIR analysis' bound on the
+/// key-switching noise of a single automorphism; composing it across
+/// `log2(poly_len)` packing levels the way this model does is a heuristic, and
+/// measurement puts the real contribution roughly 1.85x above it (visible at
+/// 2048, where that term dominates; invisible at 4096, where the modulus
+/// switch dominates). Rather than presenting the composition as a bound it
+/// isn't, the term is scaled so the total is an over-estimate.
+///
+/// `noise_bound_dominates_measurement` in `scheme.rs` fails if real noise ever
+/// crosses the resulting bound, so this constant cannot silently rot.
+pub const PACKING_TERM_SLACK: f64 = 2.0;
+
+/// A term-by-term upper bound on the noise of a decoded YPIR-SP response,
+/// together with the failure probability it implies.
+///
+/// All noise quantities are subgaussian *width squared* (`sigma^2 * 2*pi`) in
+/// the modulus-switched domain, i.e. the domain in which `tau` is the decoding
+/// half-window. Multiply by `(q / q_prime_1)^2` to compare against
+/// [`measure_noise_width_squared`], which measures in the `q` domain.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct YPIRSPNoiseReport {
     pub poly_len: usize,
     pub instances: usize,
+    pub db_rows: usize,
     pub gadget_digits: usize,
     pub gadget_bits_per_digit: usize,
     pub gadget_base: u64,
+    /// Row 0 is switched to `q_prime_2`; its rounding error is multiplied by
+    /// the secret key when the client decrypts.
+    pub switch_secret_term: f64,
+    /// Row 1 is switched to `q_prime_1`; its rounding error enters directly.
+    pub switch_rounding_term: f64,
+    /// SimplePIR first dimension: `db_rows` query noises scaled by database
+    /// entries. This is the only `db_rows`-dependent term.
+    pub first_dim_term: f64,
+    /// Automorphism key-switching during ring packing, including
+    /// [`PACKING_TERM_SLACK`].
+    pub packing_term: f64,
+    pub packing_term_slack: f64,
+    /// Decoding half-window in the switched domain: decryption is correct iff
+    /// the noise stays inside `+/- tau`.
+    pub tau: f64,
     pub modeled_noise_width_squared: f64,
     pub modeled_failure_log2: f64,
 }
 
-/// Evaluates the analytical packing-noise bound for YPIR+SimplePIR.
+/// Bounds the decryption-failure probability of the YPIR+SimplePIR pipeline.
 ///
-/// This uses the production gadget decomposition and the SimplePIR database
-/// width (`instances * poly_len`) rather than the two-dimensional YPIR shape.
+/// Unlike a DoublePIR bound this has no second-matmul term (YPIR-SP packs the
+/// first-dimension result and sends it), and it does depend on `db_rows`, which
+/// is where the first dimension's noise enters. Panics unless `params` is a
+/// supported YPIR-SP set, since the terms are only calibrated for those.
 pub fn ypir_sp_noise_report(params: &Params) -> YPIRSPNoiseReport {
+    assert_valid_ypir_sp_params(params);
+
     let q = params.modulus as f64;
     let q_prime_large = params.get_q_prime_2() as f64;
     let q_prime_small = params.get_q_prime_1() as f64;
     let d = params.poly_len as f64;
-    let l = (params.instances * params.poly_len) as f64;
     let p = params.pt_modulus as f64;
+    let sigma_e_2 = params.noise_width.powi(2);
+    let db_rows = params.db_rows();
     let gadget_bits_per_digit = get_bits_per(params, params.t_exp_left);
     let gadget_base = 1u64 << gadget_bits_per_digit;
+    let z = gadget_base as f64;
+    let t = params.t_exp_left as f64;
 
+    // Scales a pre-switch (mod q) width^2 into the switched domain.
+    let to_switched = (q_prime_small / q).powi(2);
+
+    let switch_secret_term = (q_prime_small / q_prime_large).powi(2) * d * sigma_e_2 / 4.0;
+    // Uniform over one quantisation step of the switched domain: +/- 1/2, so
+    // variance 1/12 and width^2 = 2*pi/12.
+    let switch_rounding_term = 2.0 * PI / 12.0;
+    // Query noise has width sigma_e: `get_scaled_regev_sample` scales the error
+    // by d^-1, which ring packing's factor of d undoes. Database entries are
+    // bounded by p (worst case, not the p^2/3 of a uniform database).
+    let first_dim_term = to_switched * sigma_e_2 * db_rows as f64 * p.powi(2);
+    let packing_term =
+        to_switched * (sigma_e_2 / 4.0) * (d.powi(2) - 1.0) * (t * d * z.powi(2)) / 3.0
+            * PACKING_TERM_SLACK;
+
+    let modeled_noise_width_squared =
+        switch_secret_term + switch_rounding_term + first_dim_term + packing_term;
     let tau = tau_double(q, q_prime_small, p);
-    let modeled_noise_width_squared = sigma_2_double(
-        d,
-        q,
-        q_prime_small,
-        q_prime_large,
-        params.noise_width,
-        p,
-        gadget_base as f64,
-        l,
-    );
 
     YPIRSPNoiseReport {
         poly_len: params.poly_len,
         instances: params.instances,
+        db_rows,
         gadget_digits: params.t_exp_left,
         gadget_bits_per_digit,
         gadget_base,
+        switch_secret_term,
+        switch_rounding_term,
+        first_dim_term,
+        packing_term,
+        packing_term_slack: PACKING_TERM_SLACK,
+        tau,
         modeled_noise_width_squared,
         modeled_failure_log2: log2_delta(tau, modeled_noise_width_squared),
+    }
+}
+
+impl YPIRSPNoiseReport {
+    /// The bound expressed in the `q` domain, directly comparable with
+    /// [`measure_noise_width_squared`].
+    pub fn noise_width_squared_bound_q_domain(&self, params: &Params) -> f64 {
+        let scale = (params.modulus as f64 / params.get_q_prime_1() as f64).powi(2);
+        self.modeled_noise_width_squared * scale
+    }
+
+    /// Ratio of the bound to the `sigma^2` that would put the failure
+    /// probability at exactly `2^-40`. Below 1.0 means the target is met; the
+    /// reciprocal is how much noise headroom the parameter set has.
+    pub fn utilisation_at_2_pow_minus_40(&self) -> f64 {
+        let sigma_2_at_target = PI * self.tau.powi(2) / (41.0 * std::f64::consts::LN_2);
+        self.modeled_noise_width_squared / sigma_2_at_target
     }
 }
 
@@ -353,16 +428,10 @@ mod tests {
 
     #[test]
     fn test_ypir_sp_noise_reports_match_gadget_configuration() {
-        let params_2048 = params_for_scenario_simplepir_with_config(
-            1 << 14,
-            1 << 17,
-            YPIRSPConfig::degree_2048(),
-        );
-        let params_4096 = params_for_scenario_simplepir_with_config(
-            1 << 14,
-            1 << 17,
-            YPIRSPConfig::degree_4096(),
-        );
+        let params_2048 =
+            params_for_scenario_simplepir_with_config(1 << 14, 1 << 17, YPIRSPConfig::degree_2048());
+        let params_4096 =
+            params_for_scenario_simplepir_with_config(1 << 14, 1 << 17, YPIRSPConfig::degree_4096());
         let report_2048 = ypir_sp_noise_report(&params_2048);
         let report_4096 = ypir_sp_noise_report(&params_4096);
 
@@ -372,5 +441,87 @@ mod tests {
         assert_eq!(report_4096.gadget_base, 1 << 15);
         assert!(report_2048.modeled_failure_log2 < -40.0);
         assert!(report_4096.modeled_failure_log2 < -40.0);
+    }
+
+    /// The extra gadget digit is supposed to more than pay for the larger ring.
+    /// Assert that as a relation between the two sets, not as pinned constants,
+    /// and report the headroom each one has against the 2^-40 target.
+    #[test]
+    fn test_4096_has_more_noise_headroom_than_2048() {
+        let params_2048 =
+            params_for_scenario_simplepir_with_config(1 << 14, 1 << 17, YPIRSPConfig::degree_2048());
+        let params_4096 =
+            params_for_scenario_simplepir_with_config(1 << 14, 1 << 17, YPIRSPConfig::degree_4096());
+        let report_2048 = ypir_sp_noise_report(&params_2048);
+        let report_4096 = ypir_sp_noise_report(&params_4096);
+
+        let headroom_2048 = 1.0 / report_2048.utilisation_at_2_pow_minus_40();
+        let headroom_4096 = 1.0 / report_4096.utilisation_at_2_pow_minus_40();
+        debug!("headroom to 2^-40: 2048 = {headroom_2048:.2}x, 4096 = {headroom_4096:.2}x");
+
+        assert!(headroom_2048 > 1.0, "2048 misses 2^-40: {headroom_2048}");
+        assert!(headroom_4096 > 1.0, "4096 misses 2^-40: {headroom_4096}");
+        assert!(
+            headroom_4096 > 4.0 * headroom_2048,
+            "4096 should have several times the headroom of 2048, got \
+             {headroom_4096:.2}x vs {headroom_2048:.2}x"
+        );
+    }
+
+    /// The first dimension is the only `db_rows`-dependent contribution, and the
+    /// old model omitted it entirely, making the report identical for a 4096-row
+    /// and a 2^30-row database. Assert the dependence now exists and that it
+    /// stays sub-dominant for the shipped sets, since that is what makes the
+    /// 4096 margin insensitive to database size.
+    #[test]
+    fn test_noise_bound_depends_on_db_rows() {
+        for config in [YPIRSPConfig::degree_2048(), YPIRSPConfig::degree_4096()] {
+            let small = ypir_sp_noise_report(&params_for_scenario_simplepir_with_config(
+                1 << 14,
+                1 << 17,
+                config,
+            ));
+            let large = ypir_sp_noise_report(&params_for_scenario_simplepir_with_config(
+                1 << 30,
+                1 << 17,
+                config,
+            ));
+
+            assert!(large.db_rows > small.db_rows);
+            assert!(
+                large.first_dim_term > small.first_dim_term,
+                "poly_len {}: first-dimension term must grow with db_rows",
+                config.poly_len()
+            );
+            assert!(
+                large.modeled_noise_width_squared > small.modeled_noise_width_squared,
+                "poly_len {}: total bound must grow with db_rows",
+                config.poly_len()
+            );
+            // Sub-dominant: even at 2^30 rows the first dimension must not be
+            // what decides correctness, else the margin would erode with scale.
+            assert!(
+                large.first_dim_term < 0.1 * large.modeled_noise_width_squared,
+                "poly_len {}: first-dimension term became dominant at 2^30 rows ({} of {})",
+                config.poly_len(),
+                large.first_dim_term,
+                large.modeled_noise_width_squared
+            );
+            assert!(
+                large.modeled_failure_log2 < -40.0,
+                "poly_len {}: 2^30 rows misses 2^-40 ({})",
+                config.poly_len(),
+                large.modeled_failure_log2
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported YPIR-SP parameters")]
+    fn test_noise_report_rejects_unvalidated_params() {
+        let mut params =
+            params_for_scenario_simplepir_with_config(1 << 14, 1 << 17, YPIRSPConfig::degree_4096());
+        params.t_exp_left = 3;
+        let _ = ypir_sp_noise_report(&params);
     }
 }

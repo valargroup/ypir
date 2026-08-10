@@ -65,21 +65,58 @@ let client = YPIRClient::from_db_sz_simplepir_with_config(
 );
 ```
 
-The 4096 preset uses four gadget digits to control packing noise. Print the
-resolved cryptographic parameters and analytical noise bound with:
+#### Why four gadget digits
+
+The gadget base is derived from the digit count, not chosen independently
+(`⌊56/t⌋ + 1` bits), so `t_exp_left` is the only dial. Doubling the ring degree
+makes the packing term ~8x noisier while the decoding window (set by `p` and
+`q'_1`) does not move, so the audited `t = 3` misses by a wide margin at 4096 —
+a modelled failure probability around `2^-14`. Four digits shrink each digit
+from 19 to 15 bits, cutting that term ~192x, which over-pays the 8x. Five
+digits would buy nothing: the packing term is then already below the
+modulus-switch floor, and each extra digit costs ~25% more packing-key upload.
+
+Only `(2048, 3)` and `(4096, 4)` are accepted. `YPIRSPConfig`'s fields are
+private so no other pair is constructible, and `assert_valid_ypir_sp_params`
+re-checks the pair wherever a bare `&Params` enters the YPIR-SP path, since
+`Params` exposes `poly_len` and `t_exp_left` publicly.
+
+#### Inspecting the noise bound
 
 ```sh
 cargo run --features cli --bin analyze-sp -- \
   <NUM_ITEMS> <ITEM_SIZE_BITS> --poly-len 4096
 ```
 
-This command reports the YPIR-SP path only. The same correction that aligns
-the model with the production gadget base (`2^19` for three digits) changes
-the existing 2048-degree YPIR-double model from approximately `2^-41.75` to
-`2^-26.74` total failure probability (`2^-96.70` for the SimplePIR stage and
-`2^-26.74` for the double-PIR stage). That is below the previous `2^-40`
-target and is tracked by a regression test; it does not affect the YPIR-SP
-bounds.
+`ypir_sp_noise_report` bounds the YPIR-SP path term by term: the two
+modulus-switch contributions, the SimplePIR first dimension (the only
+`db_rows`-dependent term), and automorphism packing. It carries an explicit
+`PACKING_TERM_SLACK`, because composing the per-automorphism bound across
+`log2(poly_len)` levels is a heuristic that measurement puts ~1.85x low.
+`noise_bound_dominates_measurement` in `scheme.rs` runs the real pipeline over
+a range of shapes and fails if measured noise ever crosses the bound, so the
+slack cannot silently rot.
+
+Measured headroom against the `2^-40` correctness target, worst coefficient
+observed as a fraction of the decoding window:
+
+| set | modelled failure | worst coefficient |
+| --- | --- | --- |
+| 2048, t=3 | `2^-57` | 20–30% of window |
+| 4096, t=4 | `2^-587` | 8–10% of window |
+
+The 4096 set is the better-balanced of the two: at 2048 the packing term
+dominates the modulus-switch term ~18:1, so it sits well above its own floor,
+whereas 4096 is switch-limited and therefore close to the floor the wire format
+allows.
+
+Separately, aligning the model with the production gadget base (`2^19` for
+three digits) changes the 2048-degree **YPIR-double** model from approximately
+`2^-41.75` to `2^-26.74` total failure probability (`2^-96.70` for the
+SimplePIR stage and `2^-26.74` for the double-PIR stage). That is below the
+previous `2^-40` target and is tracked by a characterization test. It does not
+affect the YPIR-SP bounds, and the double path is unreachable from the shipped
+binaries, which require `--is-simplepir`.
 
 ### Interpreting measurements
 This is an annotated version of the output
