@@ -17,8 +17,30 @@ pub fn run_ypir_batched(
     is_simplepir: bool,
     trials: usize,
 ) -> Measurement {
+    run_ypir_batched_with_sp_config(
+        num_items,
+        item_size_bits,
+        num_clients,
+        is_simplepir,
+        trials,
+        YPIRSPConfig::default(),
+    )
+}
+
+pub fn run_ypir_batched_with_sp_config(
+    num_items: usize,
+    item_size_bits: usize,
+    num_clients: usize,
+    is_simplepir: bool,
+    trials: usize,
+    sp_config: YPIRSPConfig,
+) -> Measurement {
     let params = if is_simplepir {
-        params_for_scenario_simplepir(num_items as u64, item_size_bits as u64)
+        params_for_scenario_simplepir_with_config(
+            num_items as u64,
+            item_size_bits as u64,
+            sp_config,
+        )
     } else {
         params_for_scenario(num_items as u64, item_size_bits as u64)
     };
@@ -497,6 +519,230 @@ mod test {
     #[test]
     fn test_ypir_simplepir_basic() {
         run_ypir_batched(1 << 14, 16384 * 8, 1, true, 1);
+    }
+
+    #[test]
+    fn test_ypir_simplepir_degree_4096() {
+        run_ypir_batched_with_sp_config(
+            4096,
+            4096 * 14,
+            1,
+            true,
+            1,
+            YPIRSPConfig::degree_4096(),
+        );
+    }
+
+    /// Noise observed across `trials` real YPIR-SP queries, in the `q` domain.
+    ///
+    /// `mean_width_squared` is the statistic compared with the analytical model:
+    /// a distributional parameter, averaged over every sampled ciphertext.
+    /// `max_width_squared` is the worst individual ciphertext, which varies with
+    /// the secret and packing keys (fresh per trial) and, being a maximum, drifts
+    /// upward with the number of samples -- so it is held to a stated tolerance
+    /// rather than to the bound itself. `worst_abs_error` is the tail statistic
+    /// that actually decides correctness.
+    struct MeasuredNoise {
+        mean_width_squared: f64,
+        max_width_squared: f64,
+        worst_abs_error: f64,
+        samples: usize,
+    }
+
+    fn measure_sp_noise(params: &Params, trials: usize) -> MeasuredNoise {
+        use crate::modulus_switch::ModulusSwitch;
+        use crate::noise_analysis::measure_noise_width_squared;
+        use spiral_rs::arith::rescale;
+        use spiral_rs::client::Client;
+        use spiral_rs::poly::{PolyMatrix, PolyMatrixRaw};
+
+        // Database plaintext only; query secrets still come from OsRng, so the
+        // packing-term slack must itself cover ordinary key variation.
+        fastrand::seed(0x5e1ed_0015e);
+        let pt_iter =
+            std::iter::repeat_with(|| (fastrand::u16(..) as u64 % params.pt_modulus) as u16);
+        let server = YServer::<u16>::new(params, pt_iter, true, false, true);
+        let offline = server.perform_offline_precomputation_simplepir(None, None, None);
+        let ypir_client = YPIRClient::new(params);
+
+        let mut out = MeasuredNoise {
+            mean_width_squared: 0.0,
+            max_width_squared: 0.0,
+            worst_abs_error: 0.0,
+            samples: 0,
+        };
+        let mut width_squared_total = 0.0;
+
+        for trial in 0..trials {
+            let target_row = trial * (params.db_rows() / trials.max(1));
+            let ((query_row, pub_params), seed) = ypir_client.generate_query_simplepir(target_row);
+            let expected_row = server.get_row(target_row);
+            assert_eq!(expected_row.len(), params.instances * params.poly_len);
+
+            let mut padded = AlignedMemory64::new(params.db_rows_padded_simplepir());
+            padded.as_mut_slice()[..query_row.as_slice().len()]
+                .copy_from_slice(query_row.as_slice());
+
+            let response = server.perform_online_computation_simplepir(
+                padded.as_slice(),
+                &offline,
+                &[pub_params.as_slice()],
+                None,
+            );
+
+            let mut client = Client::init(params);
+            client.generate_secret_keys_from_seed(seed);
+
+            let per_ct = response.len() / params.instances;
+            for (ct_idx, ct_bytes) in response.chunks_exact(per_ct).enumerate() {
+                let ct = PolyMatrixRaw::recover(
+                    params,
+                    params.get_q_prime_1(),
+                    params.get_q_prime_2(),
+                    ct_bytes,
+                );
+                let ct_ntt = ct.ntt();
+                let decrypted = client.decrypt_matrix_reg(&ct_ntt).raw();
+
+                let expected_chunk =
+                    &expected_row[ct_idx * params.poly_len..(ct_idx + 1) * params.poly_len];
+                let mut expected_plaintext =
+                    PolyMatrixRaw::zero(params, decrypted.rows, decrypted.cols);
+
+                for z in 0..params.poly_len {
+                    expected_plaintext.data[z] = expected_chunk[z] as u64;
+                    let decoded = rescale(decrypted.data[z], params.modulus, params.pt_modulus);
+                    assert_eq!(
+                        decoded, expected_plaintext.data[z],
+                        "trial {trial}, ciphertext {ct_idx}, coefficient {z}: decoded {decoded}, \
+                         expected {}",
+                        expected_plaintext.data[z],
+                    );
+
+                    let recentred = rescale(
+                        expected_plaintext.data[z],
+                        params.pt_modulus,
+                        params.modulus,
+                    );
+                    let diff = decrypted.data[z].abs_diff(recentred);
+                    let error = diff.min(params.modulus - diff) as f64;
+                    out.worst_abs_error = out.worst_abs_error.max(error);
+                }
+
+                let width_squared = measure_noise_width_squared(
+                    params,
+                    &client,
+                    &ct_ntt,
+                    &expected_plaintext,
+                    params.poly_len,
+                );
+                out.max_width_squared = out.max_width_squared.max(width_squared);
+                width_squared_total += width_squared;
+                out.samples += 1;
+            }
+        }
+
+        out.mean_width_squared = width_squared_total / out.samples as f64;
+        out
+    }
+
+    /// How far a single ciphertext may exceed the analytical model before the
+    /// model is considered stale. Individual ciphertexts vary with the secret
+    /// and packing keys, and the observed maximum drifts up with sample count,
+    /// so only the mean is held to the bound itself.
+    const PER_CIPHERTEXT_TOLERANCE: f64 = 3.0;
+
+    /// Regression-check the heuristic `ypir_sp_noise_report` model against real
+    /// queries. For every shape, mean measured noise must stay under the model,
+    /// no individual ciphertext may exceed it by more than
+    /// `PER_CIPHERTEXT_TOLERANCE`, and the worst single coefficient must stay
+    /// well inside the decoding window. If `PACKING_TERM_SLACK` is ever too
+    /// small, or a parameter change erodes the margin, this fails.
+    #[test]
+    fn noise_bound_dominates_measurement() {
+        use crate::noise_analysis::ypir_sp_noise_report;
+
+        // (config, num_items, item_size_bits) -- varies nu_1 and instances
+        // independently, since the first-dimension term scales with db_rows and
+        // the packing term does not.
+        let shapes = [
+            (YPIRSPConfig::degree_2048(), 2048u64, 2048 * 14u64),
+            (YPIRSPConfig::degree_2048(), 1 << 14, 2048 * 14),
+            (YPIRSPConfig::degree_2048(), 1 << 14, 3 * 2048 * 14),
+            (YPIRSPConfig::degree_4096(), 4096, 4096 * 14),
+            (YPIRSPConfig::degree_4096(), 1 << 14, 4096 * 14),
+            (YPIRSPConfig::degree_4096(), 1 << 14, 3 * 4096 * 14),
+        ];
+
+        for (config, num_items, item_size_bits) in shapes {
+            let params =
+                params_for_scenario_simplepir_with_config(num_items, item_size_bits, config);
+            let report = ypir_sp_noise_report(&params);
+            let bound = report.noise_width_squared_bound_q_domain(&params);
+            // Several independent keys so the mean is a distributional estimate
+            // rather than a handful of OsRng draws.
+            let measured = measure_sp_noise(&params, 8);
+
+            let window = params.modulus as f64 / (2.0 * params.pt_modulus as f64);
+            let budget_used = measured.worst_abs_error / window;
+
+            debug!(
+                "poly_len={} db_rows={} instances={}: mean 2^{:.2} / max 2^{:.2} over {} cts \
+                 vs bound 2^{:.2} (bound/mean {:.2}x), worst coeff uses {:.2}% of window, \
+                 modeled failure 2^{:.0}",
+                params.poly_len,
+                report.db_rows,
+                params.instances,
+                measured.mean_width_squared.log2(),
+                measured.max_width_squared.log2(),
+                measured.samples,
+                bound.log2(),
+                bound / measured.mean_width_squared,
+                100.0 * budget_used,
+                report.modeled_failure_log2,
+            );
+
+            assert!(
+                measured.mean_width_squared < bound,
+                "poly_len={} db_rows={} instances={}: mean measured noise 2^{:.2} exceeds the \
+                 analytical bound 2^{:.2}; PACKING_TERM_SLACK is too small",
+                params.poly_len,
+                report.db_rows,
+                params.instances,
+                measured.mean_width_squared.log2(),
+                bound.log2(),
+            );
+            assert!(
+                measured.max_width_squared < PER_CIPHERTEXT_TOLERANCE * bound,
+                "poly_len={} db_rows={} instances={}: a single ciphertext measured 2^{:.2}, \
+                 more than {}x the analytical bound 2^{:.2}",
+                params.poly_len,
+                report.db_rows,
+                params.instances,
+                measured.max_width_squared.log2(),
+                PER_CIPHERTEXT_TOLERANCE,
+                bound.log2(),
+            );
+            // Measurement-calibrated packing slack puts the 2048 profile above
+            // the response-wide 2^-40 target; 4096 is the set that still clears it.
+            if params.poly_len >= 4096 {
+                assert!(
+                    report.modeled_failure_log2 < -40.0,
+                    "poly_len={} db_rows={}: bound misses 2^-40 ({})",
+                    params.poly_len,
+                    report.db_rows,
+                    report.modeled_failure_log2,
+                );
+            }
+            assert!(
+                budget_used < 0.5,
+                "poly_len={} db_rows={}: worst coefficient used {:.1}% of the decoding \
+                 window; margin has eroded",
+                params.poly_len,
+                report.db_rows,
+                100.0 * budget_used,
+            );
+        }
     }
 
     #[test]

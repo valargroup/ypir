@@ -24,6 +24,9 @@ struct Args {
     /// If set, run using SimplePIR instead of Double
     #[clap(long, short, action)]
     is_simplepir: bool,
+    /// RLWE polynomial degree for YPIR-SP (2048 or 4096)
+    #[clap(long, default_value_t = 2048)]
+    poly_len: usize,
     /// Port
     #[clap(long, short, default_value = "8080")]
     port: u16,
@@ -44,6 +47,7 @@ fn main() {
         item_size_bits,
         verbose,
         is_simplepir,
+        poly_len,
         port,
     } = args;
 
@@ -77,7 +81,11 @@ fn main() {
         env_logger::init();
     }
 
-    let client = YPIRClient::from_db_sz(num_items as u64, item_size_bits as u64, is_simplepir);
+    let client = YPIRClient::from_db_sz_simplepir_with_config(
+        num_items as u64,
+        item_size_bits as u64,
+        YPIRSPConfig::for_poly_len(poly_len),
+    );
     assert!(target_row < client.params().db_rows());
 
     let (query, client_seed) = client.generate_query_simplepir(target_row);

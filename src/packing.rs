@@ -448,6 +448,7 @@ pub fn pack_using_precomp_vals<'a>(
 
     let mut idx_precomp = 0;
     let mut num_muls = 0;
+    let reduction_interval = safe_packing_reduction_interval(params);
     for cur_ell in 1..=ell {
         let mut num_in = 1 << (ell - cur_ell + 1);
         let num_out = num_in >> 1;
@@ -506,8 +507,9 @@ pub fn pack_using_precomp_vals<'a>(
                 time_3 += now.elapsed().as_micros();
                 let now = Instant::now();
 
-                // second condition prevents overflow
-                if i < num_out / 2 && ((cur_ell - 1) % 5 != 0) {
+                // The second condition reduces before the unreduced accumulator
+                // can exceed u64 for this parameter set.
+                if i < num_out / 2 && ((cur_ell - 1) % reduction_interval != 0) {
                     fast_add_into_no_reduce(ct_even, &w_times_ginv_ct);
                 } else {
                     // reduction right before or after addition is much faster than at multiplication time
@@ -582,6 +584,56 @@ pub fn pack_using_precomp_vals<'a>(
     // }
 
     out
+}
+
+/// Returns the longest safe interval between reductions in the optimized
+/// packing accumulator.
+///
+/// It models worst-case accumulator growth in units of `q^2`, using the
+/// largest CRT modulus. The first level contributes `t`; each later level
+/// doubles the previous bound and adds `4 + t`. The `4` accounts for
+/// intermediate values that are only partially reduced and may approach
+/// `2q`, while `t` accounts for gadget products.
+///
+/// The bound is computed in `u128` so parameter changes cannot silently
+/// overflow the calculation.
+fn safe_packing_reduction_interval(params: &Params) -> usize {
+    let t = params.t_exp_left as u128;
+    assert!(t > 0, "t_exp_left must be non-zero");
+
+    let q = params
+        .moduli
+        .iter()
+        .copied()
+        .max()
+        .expect("packing requires at least one CRT modulus") as u128;
+    let q_squared = q * q;
+    let max_coefficient = (u64::MAX as u128) / q_squared;
+
+    let mut peak_coefficient = t;
+    assert!(
+        peak_coefficient <= max_coefficient,
+        "packing accumulator cannot hold even one level"
+    );
+
+    let mut interval = 0;
+    loop {
+        let next_peak = peak_coefficient
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(4 + t))
+            .unwrap_or(u128::MAX);
+        if next_peak > max_coefficient {
+            break;
+        }
+        peak_coefficient = next_peak;
+        interval += 1;
+    }
+
+    // At loop exit, peak_coefficient is M_{1+interval}. Thus, for a nonzero
+    // interval, `(cur_ell - 1) % interval == 0` reduces exactly when that
+    // largest safe peak is reached; using `interval + 1` would allow one
+    // unsafe recurrence step. Zero means only M_1 fits, so reduce every level.
+    interval.max(1)
 }
 
 pub fn pack_single_lwe<'a>(
@@ -695,7 +747,18 @@ pub fn fast_multiply_no_reduce(
     assert_eq!(res.cols, 1);
 
     assert_eq!(a.cols, b.rows);
-    assert_eq!(params.crt_count * params.poly_len, 2 * 2048);
+    assert_eq!(params.crt_count, 2);
+    assert_eq!(
+        params.poly_len % 8,
+        0,
+        "AVX-512 multiplication requires poly_len to be divisible by 8"
+    );
+    assert_eq!(res.params.crt_count, params.crt_count);
+    assert_eq!(a.params.crt_count, params.crt_count);
+    assert_eq!(b.params.crt_count, params.crt_count);
+    assert_eq!(res.params.poly_len, params.poly_len);
+    assert_eq!(a.params.poly_len, params.poly_len);
+    assert_eq!(b.params.poly_len, params.poly_len);
 
     unsafe {
         let a_ptr = a.as_slice().as_ptr();
@@ -746,7 +809,13 @@ pub fn fast_multiply_no_reduce(
     assert_eq!(res.cols, 1);
 
     assert_eq!(a.cols, b.rows);
-    assert_eq!(params.crt_count * params.poly_len, 2 * 2048);
+    assert_eq!(params.crt_count, 2);
+    assert_eq!(res.params.crt_count, params.crt_count);
+    assert_eq!(a.params.crt_count, params.crt_count);
+    assert_eq!(b.params.crt_count, params.crt_count);
+    assert_eq!(res.params.poly_len, params.poly_len);
+    assert_eq!(a.params.poly_len, params.poly_len);
+    assert_eq!(b.params.poly_len, params.poly_len);
 
     unsafe {
         let a_ptr = a.as_slice().as_ptr();
@@ -1270,11 +1339,106 @@ mod test {
     use spiral_rs::{client::Client, number_theory::invert_uint_mod, util::get_test_params};
 
     use crate::{
-        client::raw_generate_expansion_params, params::params_for_scenario,
+        client::raw_generate_expansion_params,
+        params::{params_for_scenario, params_for_scenario_simplepir_with_config, YPIRSPConfig},
         server::generate_y_constants,
     };
 
     use super::*;
+
+    /// Independently replays the accumulator recurrence for `params` at the
+    /// given reduction interval and returns the peak coefficient of `q^2`
+    /// reached just before the reduction that closes the first stretch.
+    ///
+    /// The first stretch is the worst one: it starts at `M_1 = t` (level 1
+    /// leaves lower-half entries unreduced without consulting the interval),
+    /// whereas every later stretch restarts from a reduced, i.e. effectively
+    /// zero, accumulator.
+    fn replay_peak(params: &Params, interval: usize) -> u128 {
+        let t = params.t_exp_left as u128;
+        let mut peak = t;
+        for _ in 0..interval {
+            peak = 2 * peak + 4 + t;
+        }
+        peak
+    }
+
+    fn u64_budget_in_q_squared(params: &Params) -> u128 {
+        let q = *params.moduli.iter().max().unwrap() as u128;
+        (u64::MAX as u128) / (q * q)
+    }
+
+    #[test]
+    fn test_safe_packing_reduction_intervals() {
+        let params_2048 =
+            params_for_scenario_simplepir_with_config(2048, 2048 * 14, YPIRSPConfig::degree_2048());
+        let params_4096 =
+            params_for_scenario_simplepir_with_config(4096, 4096 * 14, YPIRSPConfig::degree_4096());
+
+        assert_eq!(safe_packing_reduction_interval(&params_2048), 4);
+        assert_eq!(safe_packing_reduction_interval(&params_4096), 4);
+
+        let q = *params_4096.moduli.iter().max().unwrap() as u128;
+        let mut reduce_every_level = params_4096.clone();
+        reduce_every_level.t_exp_left = ((u64::MAX as u128) / (q * q)) as usize;
+        assert_eq!(safe_packing_reduction_interval(&reduce_every_level), 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_fast_multiply_rejects_mismatched_matrix_degree() {
+        let matrix_params =
+            params_for_scenario_simplepir_with_config(2048, 2048 * 14, YPIRSPConfig::degree_2048());
+        let multiply_params =
+            params_for_scenario_simplepir_with_config(4096, 4096 * 14, YPIRSPConfig::degree_4096());
+        let mut res = PolyMatrixNTT::zero(&matrix_params, 1, 1);
+        let a = PolyMatrixNTT::zero(&matrix_params, 1, 1);
+        let b = PolyMatrixNTT::zero(&matrix_params, 1, 1);
+
+        fast_multiply_no_reduce(&multiply_params, &mut res, &a, &b, 0);
+    }
+
+    /// The property the interval exists to guarantee: at the interval actually
+    /// used, the accumulator provably cannot exceed `u64::MAX`, and one more
+    /// level provably would. Re-derived here from the recurrence rather than
+    /// read back from the implementation, so a change to either side is caught.
+    #[test]
+    fn test_packing_accumulator_cannot_overflow_u64() {
+        for (label, params) in [
+            (
+                "2048",
+                params_for_scenario_simplepir_with_config(
+                    2048,
+                    2048 * 14,
+                    YPIRSPConfig::degree_2048(),
+                ),
+            ),
+            (
+                "4096",
+                params_for_scenario_simplepir_with_config(
+                    4096,
+                    4096 * 14,
+                    YPIRSPConfig::degree_4096(),
+                ),
+            ),
+        ] {
+            let budget = u64_budget_in_q_squared(&params);
+            let interval = safe_packing_reduction_interval(&params);
+
+            let peak = replay_peak(&params, interval);
+            assert!(
+                peak <= budget,
+                "{label}: peak {peak} q^2 exceeds the {budget} q^2 u64 budget at interval {interval}"
+            );
+
+            let over = replay_peak(&params, interval + 1);
+            assert!(
+                over > budget,
+                "{label}: interval {interval} is not maximal; {} levels still fit ({over} <= {budget})",
+                interval + 1
+            );
+        }
+    }
 
     #[test]
     fn test_packing() {

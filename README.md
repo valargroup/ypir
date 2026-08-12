@@ -47,6 +47,84 @@ Options:
   -V, --version  Print version
 ```
 
+### YPIR-SP ring dimension
+
+YPIR-SP defaults to the audited 2048-degree parameter set. The experimental
+4096-degree set can be selected with `--poly-len 4096` on the `run`, `client`,
+and `server` binaries. Clients and servers must select the same degree.
+
+Library callers can select it explicitly:
+
+```rust
+use valar_ypir::{client::YPIRClient, params::YPIRSPConfig};
+
+let client = YPIRClient::from_db_sz_simplepir_with_config(
+    num_items,
+    item_size_bits,
+    YPIRSPConfig::degree_4096(),
+);
+```
+
+#### Why four gadget digits
+
+The gadget base is derived from the digit count, not chosen independently
+(`⌊56/t⌋ + 1` bits), so `t_exp_left` is the only dial. Doubling the ring degree
+makes the packing term ~8x noisier while the decoding window (set by `p` and
+`q'_1`) does not move, so the audited `t = 3` misses by a wide margin at 4096 —
+a modelled failure probability around `2^-14`. Four digits shrink each digit
+from 19 to 15 bits, cutting that term ~192x, which over-pays the 8x. Five
+digits would buy nothing: the packing term is then already below the
+modulus-switch floor, and each extra digit costs ~25% more packing-key upload.
+
+Only `(2048, 3)` and `(4096, 4)` are accepted. `YPIRSPConfig`'s fields are
+private so no other pair is constructible, and `assert_valid_ypir_sp_params`
+re-checks the pair wherever a bare `&Params` enters the YPIR-SP path, since
+`Params` exposes `poly_len` and `t_exp_left` publicly.
+
+#### Inspecting the noise bound
+
+```sh
+cargo run --features cli --bin analyze-sp -- \
+  <NUM_ITEMS> <ITEM_SIZE_BITS> --poly-len 4096
+```
+
+`ypir_sp_noise_report` models the YPIR-SP path term by term: the two
+modulus-switch contributions, the SimplePIR first dimension (the only
+`db_rows`-dependent term), and automorphism packing. It carries an explicit
+`PACKING_TERM_SLACK`, because composing the per-automorphism bound across
+`log2(poly_len)` levels is a heuristic that measurement puts ~2.3x low.
+`noise_bound_dominates_measurement` in `scheme.rs` runs the real pipeline over
+a range of shapes, verifies every decoded coefficient against the requested
+database row, and fails if measured noise crosses the model. This provides
+randomized regression evidence that the slack has not gone stale; it does not
+turn the heuristic packing composition or its modeled failure probabilities
+into a mathematical bound.
+
+For 16,384 rows of 131,072-bit items, the model reports both the estimated tail
+probability for one coefficient and a response-wide estimate obtained by
+union-bounding over
+`poly_len * instances` decoded coefficients. The response-wide value is the
+one compared with the `2^-40` correctness target:
+
+| set | modeled per-coefficient failure | modeled response failure | worst sampled coefficient |
+| --- | --- | --- | --- |
+| 2048, t=3 | `2^-46.03` | `2^-32.71` | 20–30% of window |
+| 4096, t=4 | `2^-532.75` | `2^-519.16` | 8–10% of window |
+
+With measurement-calibrated packing slack, the 2048 set no longer meets
+response-wide `2^-40` for this (or even single-ciphertext) shape: packing
+dominates the modulus-switch term ~37:1 and sits well above the switch floor.
+The 4096 set is switch-limited and therefore close to the floor the wire format
+allows, which is why it retains a large margin.
+
+Separately, aligning the model with the production gadget base (`2^19` for
+three digits) changes the 2048-degree **YPIR-double** model from approximately
+`2^-41.75` to `2^-26.74` total failure probability (`2^-96.70` for the
+SimplePIR stage and `2^-26.74` for the double-PIR stage). That is below the
+previous `2^-40` target and is tracked by a characterization test. It does not
+affect the YPIR-SP bounds, and the double path is unreachable from the shipped
+binaries, which require `--is-simplepir`.
+
 ### Interpreting measurements
 This is an annotated version of the output
 of running `RUST_LOG=debug cargo run --profile release-with-debug --bin server 8589934592 1` 

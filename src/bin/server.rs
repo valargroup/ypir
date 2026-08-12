@@ -22,6 +22,9 @@ struct Args {
     /// If set, run using SimplePIR instead of Double
     #[clap(long, short, action)]
     is_simplepir: bool,
+    /// RLWE polynomial degree for YPIR-SP (2048 or 4096)
+    #[clap(long, default_value_t = 2048)]
+    poly_len: usize,
     /// Port
     #[clap(long, short, default_value = "8080")]
     port: u16,
@@ -84,6 +87,7 @@ async fn main() -> std::io::Result<()> {
         random,
         verbose,
         is_simplepir,
+        poly_len,
         port,
     } = args;
 
@@ -105,8 +109,8 @@ async fn main() -> std::io::Result<()> {
 
     if item_size_bits > 8 && !is_simplepir {
         panic!("Items can be at must be at most 8 bits.");
-    } else if is_simplepir && item_size_bits < 2048 {
-        panic!("YPIR-SP requires items to be at least 2048 bits.");
+    } else if is_simplepir && item_size_bits == 0 {
+        panic!("YPIR-SP items must not be empty.");
     }
 
     println!(
@@ -120,7 +124,11 @@ async fn main() -> std::io::Result<()> {
     );
 
     let params = if is_simplepir {
-        params_for_scenario_simplepir(num_items as u64, item_size_bits as u64)
+        params_for_scenario_simplepir_with_config(
+            num_items as u64,
+            item_size_bits as u64,
+            YPIRSPConfig::for_poly_len(poly_len),
+        )
     } else {
         params_for_scenario(num_items as u64, item_size_bits as u64)
     };
@@ -132,6 +140,11 @@ async fn main() -> std::io::Result<()> {
         YServer::<u16>::new(leaked_params, pt_iter, true, false, true)
     } else {
         assert!(inp_file.is_some());
+        assert_eq!(
+            item_size_bits % 8,
+            0,
+            "file-backed YPIR-SP items must be byte-aligned"
+        );
         let inp_file = inp_file.unwrap();
         let pt_bits = (pt_modulus as f64).log2().ceil() as usize;
         let pt_iter = FilePtIter::from_file(
