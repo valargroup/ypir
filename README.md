@@ -88,21 +88,25 @@ cargo run --features cli --bin analyze-sp -- \
   <NUM_ITEMS> <ITEM_SIZE_BITS> --poly-len 4096
 ```
 
-`ypir_sp_noise_report` bounds the YPIR-SP path term by term: the two
+`ypir_sp_noise_report` models the YPIR-SP path term by term: the two
 modulus-switch contributions, the SimplePIR first dimension (the only
 `db_rows`-dependent term), and automorphism packing. It carries an explicit
 `PACKING_TERM_SLACK`, because composing the per-automorphism bound across
 `log2(poly_len)` levels is a heuristic that measurement puts ~1.85x low.
 `noise_bound_dominates_measurement` in `scheme.rs` runs the real pipeline over
-a range of shapes and fails if measured noise ever crosses the bound, so the
-slack cannot silently rot.
+a range of shapes, verifies every decoded coefficient against the requested
+database row, and fails if measured noise crosses the model. This provides
+randomized regression evidence that the slack has not gone stale; it does not
+turn the heuristic packing composition or its modeled failure probabilities
+into a mathematical bound.
 
-For 16,384 rows of 131,072-bit items, the model reports both the tail bound for
-one coefficient and a response-wide bound obtained by union-bounding over
+For 16,384 rows of 131,072-bit items, the model reports both the estimated tail
+probability for one coefficient and a response-wide estimate obtained by
+union-bounding over
 `poly_len * instances` decoded coefficients. The response-wide value is the
 one compared with the `2^-40` correctness target:
 
-| set | per-coefficient failure | response failure | worst coefficient |
+| set | modeled per-coefficient failure | modeled response failure | worst sampled coefficient |
 | --- | --- | --- | --- |
 | 2048, t=3 | `2^-57.40` | `2^-44.08` | 20–30% of window |
 | 4096, t=4 | `2^-586.88` | `2^-573.29` | 8–10% of window |

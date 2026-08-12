@@ -535,7 +535,7 @@ mod test {
 
     /// Noise observed across `trials` real YPIR-SP queries, in the `q` domain.
     ///
-    /// `mean_width_squared` is the statistic the analytical bound is a bound on:
+    /// `mean_width_squared` is the statistic compared with the analytical model:
     /// a distributional parameter, averaged over every sampled ciphertext.
     /// `max_width_squared` is the worst individual ciphertext, which varies with
     /// the secret and packing keys (fresh per trial) and, being a maximum, drifts
@@ -573,6 +573,8 @@ mod test {
         for trial in 0..trials {
             let target_row = trial * (params.db_rows() / trials.max(1));
             let ((query_row, pub_params), seed) = ypir_client.generate_query_simplepir(target_row);
+            let expected_row = server.get_row(target_row);
+            assert_eq!(expected_row.len(), params.instances * params.poly_len);
 
             let mut padded = AlignedMemory64::new(params.db_rows_padded_simplepir());
             padded.as_mut_slice()[..query_row.as_slice().len()]
@@ -589,7 +591,7 @@ mod test {
             client.generate_secret_keys_from_seed(seed);
 
             let per_ct = response.len() / params.instances;
-            for ct_bytes in response.chunks_exact(per_ct) {
+            for (ct_idx, ct_bytes) in response.chunks_exact(per_ct).enumerate() {
                 let ct = PolyMatrixRaw::recover(
                     params,
                     params.get_q_prime_1(),
@@ -599,15 +601,26 @@ mod test {
                 let ct_ntt = ct.ntt();
                 let decrypted = client.decrypt_matrix_reg(&ct_ntt).raw();
 
-                let mut rescaled = PolyMatrixRaw::zero(params, decrypted.rows, decrypted.cols);
-                for z in 0..rescaled.data.len() {
-                    rescaled.data[z] =
-                        rescale(decrypted.data[z], params.modulus, params.pt_modulus);
-                }
+                let expected_chunk =
+                    &expected_row[ct_idx * params.poly_len..(ct_idx + 1) * params.poly_len];
+                let mut expected_plaintext =
+                    PolyMatrixRaw::zero(params, decrypted.rows, decrypted.cols);
 
                 for z in 0..params.poly_len {
-                    let recentred =
-                        rescale(rescaled.data[z], params.pt_modulus, params.modulus);
+                    expected_plaintext.data[z] = expected_chunk[z] as u64;
+                    let decoded = rescale(decrypted.data[z], params.modulus, params.pt_modulus);
+                    assert_eq!(
+                        decoded, expected_plaintext.data[z],
+                        "trial {trial}, ciphertext {ct_idx}, coefficient {z}: decoded {decoded}, \
+                         expected {}",
+                        expected_plaintext.data[z],
+                    );
+
+                    let recentred = rescale(
+                        expected_plaintext.data[z],
+                        params.pt_modulus,
+                        params.modulus,
+                    );
                     let diff = decrypted.data[z].abs_diff(recentred);
                     let error = diff.min(params.modulus - diff) as f64;
                     out.worst_abs_error = out.worst_abs_error.max(error);
@@ -617,7 +630,7 @@ mod test {
                     params,
                     &client,
                     &ct_ntt,
-                    &rescaled,
+                    &expected_plaintext,
                     params.poly_len,
                 );
                 out.max_width_squared = out.max_width_squared.max(width_squared);
@@ -630,15 +643,15 @@ mod test {
         out
     }
 
-    /// How far a single ciphertext may exceed the analytical bound before the
-    /// bound is considered wrong. Individual ciphertexts vary with the secret
+    /// How far a single ciphertext may exceed the analytical model before the
+    /// model is considered stale. Individual ciphertexts vary with the secret
     /// and packing keys, and the observed maximum drifts up with sample count,
     /// so only the mean is held to the bound itself.
     const PER_CIPHERTEXT_TOLERANCE: f64 = 2.0;
 
-    /// The test that makes `ypir_sp_noise_report` a checked bound rather than an
-    /// estimate: for every shape, mean measured noise must stay under the
-    /// analytical bound, no individual ciphertext may exceed it by more than
+    /// Regression-check the heuristic `ypir_sp_noise_report` model against real
+    /// queries. For every shape, mean measured noise must stay under the model,
+    /// no individual ciphertext may exceed it by more than
     /// `PER_CIPHERTEXT_TOLERANCE`, and the worst single coefficient must stay
     /// well inside the decoding window. If `PACKING_TERM_SLACK` is ever too
     /// small, or a parameter change erodes the margin, this fails.

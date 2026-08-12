@@ -223,15 +223,15 @@ impl YPIRSchemeParams {
 /// `log2(poly_len)` packing levels the way this model does is a heuristic, and
 /// measurement puts the real contribution roughly 1.85x above it (visible at
 /// 2048, where that term dominates; invisible at 4096, where the modulus
-/// switch dominates). Rather than presenting the composition as a bound it
-/// isn't, the term is scaled so the total is an over-estimate.
+/// switch dominates). The slack makes the estimate conservative against the
+/// measurements sampled so far, but does not make the composition a proof.
 ///
-/// `noise_bound_dominates_measurement` in `scheme.rs` fails if real noise ever
-/// crosses the resulting bound, so this constant cannot silently rot.
+/// `noise_bound_dominates_measurement` in `scheme.rs` fails if sampled noise
+/// crosses the resulting model, so this constant cannot silently rot.
 pub const PACKING_TERM_SLACK: f64 = 2.0;
 
-/// A term-by-term upper bound on the noise of a decoded YPIR-SP response,
-/// together with the failure probability it implies.
+/// A term-by-term model of the noise of a decoded YPIR-SP response, together
+/// with its estimated failure probability.
 ///
 /// All noise quantities are subgaussian *width squared* (`sigma^2 * 2*pi`) in
 /// the modulus-switched domain, i.e. the domain in which `tau` is the decoding
@@ -264,13 +264,13 @@ pub struct YPIRSPNoiseReport {
     /// the noise stays inside `+/- tau`.
     pub tau: f64,
     pub modeled_noise_width_squared: f64,
-    /// Two-sided failure bound for one decoded coefficient.
+    /// Modeled two-sided failure probability for one decoded coefficient.
     pub modeled_coefficient_failure_log2: f64,
-    /// Union bound for any decoded coefficient failing in one response.
+    /// Union-bound estimate for any decoded coefficient failing in one response.
     pub modeled_failure_log2: f64,
 }
 
-/// Bounds the decryption-failure probability of the YPIR+SimplePIR pipeline.
+/// Models the decryption-failure probability of the YPIR+SimplePIR pipeline.
 ///
 /// Unlike a DoublePIR bound this has no second-matmul term (YPIR-SP packs the
 /// first-dimension result and sends it), and it does depend on `db_rows`, which
@@ -339,7 +339,7 @@ pub fn ypir_sp_noise_report(params: &Params) -> YPIRSPNoiseReport {
 }
 
 impl YPIRSPNoiseReport {
-    /// The bound expressed in the `q` domain, directly comparable with
+    /// The modeled width squared expressed in the `q` domain, directly comparable with
     /// [`measure_noise_width_squared`].
     pub fn noise_width_squared_bound_q_domain(&self, params: &Params) -> f64 {
         let scale = (params.modulus as f64 / params.get_q_prime_1() as f64).powi(2);
