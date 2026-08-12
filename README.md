@@ -97,13 +97,15 @@ modulus-switch contributions, the SimplePIR first dimension (the only
 a range of shapes and fails if measured noise ever crosses the bound, so the
 slack cannot silently rot.
 
-Measured headroom against the `2^-40` correctness target, worst coefficient
-observed as a fraction of the decoding window:
+For 16,384 rows of 131,072-bit items, the model reports both the tail bound for
+one coefficient and a response-wide bound obtained by union-bounding over
+`poly_len * instances` decoded coefficients. The response-wide value is the
+one compared with the `2^-40` correctness target:
 
-| set | modelled failure | worst coefficient |
-| --- | --- | --- |
-| 2048, t=3 | `2^-57` | 20–30% of window |
-| 4096, t=4 | `2^-587` | 8–10% of window |
+| set | per-coefficient failure | response failure | worst coefficient |
+| --- | --- | --- | --- |
+| 2048, t=3 | `2^-57.40` | `2^-44.08` | 20–30% of window |
+| 4096, t=4 | `2^-586.88` | `2^-573.29` | 8–10% of window |
 
 The 4096 set is the better-balanced of the two: at 2048 the packing term
 dominates the modulus-switch term ~18:1, so it sits well above its own floor,
