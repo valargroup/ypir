@@ -221,14 +221,14 @@ impl YPIRSchemeParams {
 /// The `(d^2 - 1)(t*d*z^2)/3` expression is the YPIR analysis' bound on the
 /// key-switching noise of a single automorphism; composing it across
 /// `log2(poly_len)` packing levels the way this model does is a heuristic, and
-/// measurement puts the real contribution roughly 1.85x above it (visible at
+/// measurement puts the real contribution roughly 2.3x above it (visible at
 /// 2048, where that term dominates; invisible at 4096, where the modulus
 /// switch dominates). The slack makes the estimate conservative against the
 /// measurements sampled so far, but does not make the composition a proof.
 ///
 /// `noise_bound_dominates_measurement` in `scheme.rs` fails if sampled noise
 /// crosses the resulting model, so this constant cannot silently rot.
-pub const PACKING_TERM_SLACK: f64 = 2.0;
+pub const PACKING_TERM_SLACK: f64 = 2.5;
 
 /// A term-by-term model of the noise of a decoded YPIR-SP response, together
 /// with its estimated failure probability.
@@ -469,7 +469,11 @@ mod tests {
             report_4096.decoded_coefficients,
             report_4096.instances * report_4096.poly_len
         );
-        assert!(report_2048.modeled_failure_log2 < -40.0);
+        assert!(
+            report_2048.modeled_failure_log2 > -40.0,
+            "2048 with calibrated packing slack must not claim response-wide 2^-40: {}",
+            report_2048.modeled_failure_log2
+        );
         assert!(report_4096.modeled_failure_log2 < -40.0);
     }
 
@@ -512,8 +516,8 @@ mod tests {
     }
 
     /// The extra gadget digit is supposed to more than pay for the larger ring.
-    /// Assert that as a relation between the two sets, not as pinned constants,
-    /// and report the headroom each one has against the 2^-40 target.
+    /// With measurement-calibrated packing slack the 2048 set misses response-wide
+    /// 2^-40 on this shape, while 4096 still clears it by a wide margin.
     #[test]
     fn test_4096_has_more_noise_headroom_than_2048() {
         let params_2048 =
@@ -523,16 +527,21 @@ mod tests {
         let report_2048 = ypir_sp_noise_report(&params_2048);
         let report_4096 = ypir_sp_noise_report(&params_4096);
 
-        let headroom_2048 = 1.0 / report_2048.utilisation_at_2_pow_minus_40();
-        let headroom_4096 = 1.0 / report_4096.utilisation_at_2_pow_minus_40();
-        debug!("headroom to 2^-40: 2048 = {headroom_2048:.2}x, 4096 = {headroom_4096:.2}x");
+        let util_2048 = report_2048.utilisation_at_2_pow_minus_40();
+        let util_4096 = report_4096.utilisation_at_2_pow_minus_40();
+        let headroom_4096 = 1.0 / util_4096;
+        debug!("2^-40 utilisation: 2048 = {util_2048:.2}, 4096 = {util_4096:.2}");
 
-        assert!(headroom_2048 > 1.0, "2048 misses 2^-40: {headroom_2048}");
+        assert!(
+            util_2048 > 1.0,
+            "2048 with calibrated packing slack should miss response-wide 2^-40: util={util_2048}"
+        );
         assert!(headroom_4096 > 1.0, "4096 misses 2^-40: {headroom_4096}");
         assert!(
-            headroom_4096 > 4.0 * headroom_2048,
-            "4096 should have several times the headroom of 2048, got \
-             {headroom_4096:.2}x vs {headroom_2048:.2}x"
+            report_4096.modeled_failure_log2 < report_2048.modeled_failure_log2 - 100.0,
+            "4096 should remain far safer than 2048, got {} vs {}",
+            report_4096.modeled_failure_log2,
+            report_2048.modeled_failure_log2
         );
     }
 
@@ -575,12 +584,14 @@ mod tests {
                 large.first_dim_term,
                 large.modeled_noise_width_squared
             );
-            assert!(
-                large.modeled_failure_log2 < -40.0,
-                "poly_len {}: 2^30 rows misses 2^-40 ({})",
-                config.poly_len(),
-                large.modeled_failure_log2
-            );
+            if config.poly_len() >= 4096 {
+                assert!(
+                    large.modeled_failure_log2 < -40.0,
+                    "poly_len {}: 2^30 rows misses 2^-40 ({})",
+                    config.poly_len(),
+                    large.modeled_failure_log2
+                );
+            }
         }
     }
 

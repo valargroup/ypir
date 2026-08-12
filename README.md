@@ -92,7 +92,7 @@ cargo run --features cli --bin analyze-sp -- \
 modulus-switch contributions, the SimplePIR first dimension (the only
 `db_rows`-dependent term), and automorphism packing. It carries an explicit
 `PACKING_TERM_SLACK`, because composing the per-automorphism bound across
-`log2(poly_len)` levels is a heuristic that measurement puts ~1.85x low.
+`log2(poly_len)` levels is a heuristic that measurement puts ~2.3x low.
 `noise_bound_dominates_measurement` in `scheme.rs` runs the real pipeline over
 a range of shapes, verifies every decoded coefficient against the requested
 database row, and fails if measured noise crosses the model. This provides
@@ -108,13 +108,14 @@ one compared with the `2^-40` correctness target:
 
 | set | modeled per-coefficient failure | modeled response failure | worst sampled coefficient |
 | --- | --- | --- | --- |
-| 2048, t=3 | `2^-57.40` | `2^-44.08` | 20–30% of window |
-| 4096, t=4 | `2^-586.88` | `2^-573.29` | 8–10% of window |
+| 2048, t=3 | `2^-46.03` | `2^-32.71` | 20–30% of window |
+| 4096, t=4 | `2^-532.75` | `2^-519.16` | 8–10% of window |
 
-The 4096 set is the better-balanced of the two: at 2048 the packing term
-dominates the modulus-switch term ~18:1, so it sits well above its own floor,
-whereas 4096 is switch-limited and therefore close to the floor the wire format
-allows.
+With measurement-calibrated packing slack, the 2048 set no longer meets
+response-wide `2^-40` for this (or even single-ciphertext) shape: packing
+dominates the modulus-switch term ~37:1 and sits well above the switch floor.
+The 4096 set is switch-limited and therefore close to the floor the wire format
+allows, which is why it retains a large margin.
 
 Separately, aligning the model with the production gadget base (`2^19` for
 three digits) changes the 2048-degree **YPIR-double** model from approximately

@@ -748,6 +748,11 @@ pub fn fast_multiply_no_reduce(
 
     assert_eq!(a.cols, b.rows);
     assert_eq!(params.crt_count, 2);
+    assert_eq!(
+        params.poly_len % 8,
+        0,
+        "AVX-512 multiplication requires poly_len to be divisible by 8"
+    );
     assert_eq!(res.params.crt_count, params.crt_count);
     assert_eq!(a.params.crt_count, params.crt_count);
     assert_eq!(b.params.crt_count, params.crt_count);
