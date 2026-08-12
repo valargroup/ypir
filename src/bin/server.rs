@@ -140,6 +140,11 @@ async fn main() -> std::io::Result<()> {
         YServer::<u16>::new(leaked_params, pt_iter, true, false, true)
     } else {
         assert!(inp_file.is_some());
+        assert_eq!(
+            item_size_bits % 8,
+            0,
+            "file-backed YPIR-SP items must be byte-aligned"
+        );
         let inp_file = inp_file.unwrap();
         let pt_bits = (pt_modulus as f64).log2().ceil() as usize;
         let pt_iter = FilePtIter::from_file(

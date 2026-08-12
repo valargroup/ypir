@@ -1231,6 +1231,7 @@ pub struct FilePtIter<R: Read + Seek> {
 
 impl<R: Read + Seek> FilePtIter<R> {
     pub fn new(file: R, bytes_per_row: usize, db_cols: usize, pt_bits: usize) -> Self {
+        assert!(bytes_per_row > 0, "file rows must not be empty");
         let max_filled_col = (bytes_per_row * 8 + pt_bits - 1) / pt_bits;
         assert!(max_filled_col <= db_cols);
 
@@ -1400,6 +1401,12 @@ mod test {
                 u32::from_be_bytes(ci_bytes[1..5].try_into().unwrap())
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "file rows must not be empty")]
+    fn test_pt_iter_rejects_empty_rows() {
+        FilePtIter::new(Cursor::new(vec![0xff]), 0, 1, 14);
     }
 
     #[test]
