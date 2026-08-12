@@ -69,6 +69,11 @@ fn log2_delta(tau: f64, sigma_2: f64) -> f64 {
     1.0 - PI * tau.powi(2) / (sigma_2 * std::f64::consts::LN_2)
 }
 
+fn log2_union_bound(log2_probability: f64, event_count: usize) -> f64 {
+    assert!(event_count > 0);
+    log2_probability + (event_count as f64).log2()
+}
+
 fn tau_simple(q_1: f64, qtilde_1: f64, n: f64) -> f64 {
     let term1 = qtilde_1 / (2.0 * n);
     let term2 = -(qtilde_1 % n);
@@ -237,6 +242,8 @@ pub const PACKING_TERM_SLACK: f64 = 2.0;
 pub struct YPIRSPNoiseReport {
     pub poly_len: usize,
     pub instances: usize,
+    /// Total coefficients decoded for one SimplePIR response.
+    pub decoded_coefficients: usize,
     pub db_rows: usize,
     pub gadget_digits: usize,
     pub gadget_bits_per_digit: usize,
@@ -257,6 +264,9 @@ pub struct YPIRSPNoiseReport {
     /// the noise stays inside `+/- tau`.
     pub tau: f64,
     pub modeled_noise_width_squared: f64,
+    /// Two-sided failure bound for one decoded coefficient.
+    pub modeled_coefficient_failure_log2: f64,
+    /// Union bound for any decoded coefficient failing in one response.
     pub modeled_failure_log2: f64,
 }
 
@@ -299,10 +309,16 @@ pub fn ypir_sp_noise_report(params: &Params) -> YPIRSPNoiseReport {
     let modeled_noise_width_squared =
         switch_secret_term + switch_rounding_term + first_dim_term + packing_term;
     let tau = tau_double(q, q_prime_small, p);
+    let decoded_coefficients = params
+        .instances
+        .checked_mul(params.poly_len)
+        .expect("decoded coefficient count overflow");
+    let modeled_coefficient_failure_log2 = log2_delta(tau, modeled_noise_width_squared);
 
     YPIRSPNoiseReport {
         poly_len: params.poly_len,
         instances: params.instances,
+        decoded_coefficients,
         db_rows,
         gadget_digits: params.t_exp_left,
         gadget_bits_per_digit,
@@ -314,7 +330,11 @@ pub fn ypir_sp_noise_report(params: &Params) -> YPIRSPNoiseReport {
         packing_term_slack: PACKING_TERM_SLACK,
         tau,
         modeled_noise_width_squared,
-        modeled_failure_log2: log2_delta(tau, modeled_noise_width_squared),
+        modeled_coefficient_failure_log2,
+        modeled_failure_log2: log2_union_bound(
+            modeled_coefficient_failure_log2,
+            decoded_coefficients,
+        ),
     }
 }
 
@@ -326,11 +346,13 @@ impl YPIRSPNoiseReport {
         self.modeled_noise_width_squared * scale
     }
 
-    /// Ratio of the bound to the `sigma^2` that would put the failure
-    /// probability at exactly `2^-40`. Below 1.0 means the target is met; the
+    /// Ratio of the bound to the `sigma^2` that would put the response-level
+    /// union bound at exactly `2^-40`. Below 1.0 means the target is met; the
     /// reciprocal is how much noise headroom the parameter set has.
     pub fn utilisation_at_2_pow_minus_40(&self) -> f64 {
-        let sigma_2_at_target = PI * self.tau.powi(2) / (41.0 * std::f64::consts::LN_2);
+        let exponent_at_target = 41.0 + (self.decoded_coefficients as f64).log2();
+        let sigma_2_at_target =
+            PI * self.tau.powi(2) / (exponent_at_target * std::f64::consts::LN_2);
         self.modeled_noise_width_squared / sigma_2_at_target
     }
 }
@@ -439,8 +461,54 @@ mod tests {
         assert_eq!(report_2048.gadget_base, 1 << 19);
         assert_eq!(report_4096.gadget_bits_per_digit, 15);
         assert_eq!(report_4096.gadget_base, 1 << 15);
+        assert_eq!(
+            report_2048.decoded_coefficients,
+            report_2048.instances * report_2048.poly_len
+        );
+        assert_eq!(
+            report_4096.decoded_coefficients,
+            report_4096.instances * report_4096.poly_len
+        );
         assert!(report_2048.modeled_failure_log2 < -40.0);
         assert!(report_4096.modeled_failure_log2 < -40.0);
+    }
+
+    #[test]
+    fn test_ypir_sp_failure_bound_covers_the_full_response() {
+        let small = ypir_sp_noise_report(&params_for_scenario_simplepir_with_config(
+            1 << 14,
+            1,
+            YPIRSPConfig::degree_2048(),
+        ));
+        let one_mib = ypir_sp_noise_report(&params_for_scenario_simplepir_with_config(
+            1 << 14,
+            1 << 23,
+            YPIRSPConfig::degree_2048(),
+        ));
+
+        for report in [&small, &one_mib] {
+            let union_factor_log2 = (report.decoded_coefficients as f64).log2();
+            assert!(
+                (report.modeled_failure_log2
+                    - report.modeled_coefficient_failure_log2
+                    - union_factor_log2)
+                    .abs()
+                    < 1e-12,
+                "response bound must include all {} decoded coefficients",
+                report.decoded_coefficients
+            );
+        }
+
+        assert!(one_mib.instances > small.instances);
+        assert!(
+            one_mib.modeled_failure_log2 > -40.0,
+            "2048-degree 1 MiB responses must not be reported as meeting 2^-40: {}",
+            one_mib.modeled_failure_log2
+        );
+        assert!(
+            one_mib.utilisation_at_2_pow_minus_40() > 1.0,
+            "response-aware utilization must show that the target is missed"
+        );
     }
 
     /// The extra gadget digit is supposed to more than pay for the larger ring.
