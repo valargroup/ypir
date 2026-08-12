@@ -748,6 +748,12 @@ pub fn fast_multiply_no_reduce(
 
     assert_eq!(a.cols, b.rows);
     assert_eq!(params.crt_count, 2);
+    assert_eq!(res.params.crt_count, params.crt_count);
+    assert_eq!(a.params.crt_count, params.crt_count);
+    assert_eq!(b.params.crt_count, params.crt_count);
+    assert_eq!(res.params.poly_len, params.poly_len);
+    assert_eq!(a.params.poly_len, params.poly_len);
+    assert_eq!(b.params.poly_len, params.poly_len);
 
     unsafe {
         let a_ptr = a.as_slice().as_ptr();
@@ -799,6 +805,12 @@ pub fn fast_multiply_no_reduce(
 
     assert_eq!(a.cols, b.rows);
     assert_eq!(params.crt_count, 2);
+    assert_eq!(res.params.crt_count, params.crt_count);
+    assert_eq!(a.params.crt_count, params.crt_count);
+    assert_eq!(b.params.crt_count, params.crt_count);
+    assert_eq!(res.params.poly_len, params.poly_len);
+    assert_eq!(a.params.poly_len, params.poly_len);
+    assert_eq!(b.params.poly_len, params.poly_len);
 
     unsafe {
         let a_ptr = a.as_slice().as_ptr();
@@ -1365,6 +1377,20 @@ mod test {
         let mut reduce_every_level = params_4096.clone();
         reduce_every_level.t_exp_left = ((u64::MAX as u128) / (q * q)) as usize;
         assert_eq!(safe_packing_reduction_interval(&reduce_every_level), 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_fast_multiply_rejects_mismatched_matrix_degree() {
+        let matrix_params =
+            params_for_scenario_simplepir_with_config(2048, 2048 * 14, YPIRSPConfig::degree_2048());
+        let multiply_params =
+            params_for_scenario_simplepir_with_config(4096, 4096 * 14, YPIRSPConfig::degree_4096());
+        let mut res = PolyMatrixNTT::zero(&matrix_params, 1, 1);
+        let a = PolyMatrixNTT::zero(&matrix_params, 1, 1);
+        let b = PolyMatrixNTT::zero(&matrix_params, 1, 1);
+
+        fast_multiply_no_reduce(&multiply_params, &mut res, &a, &b, 0);
     }
 
     /// The property the interval exists to guarantee: at the interval actually
