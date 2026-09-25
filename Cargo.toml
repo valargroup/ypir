@@ -1,6 +1,6 @@
 [package]
 name = "valar-ypir"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 edition = "2021"
 description = "Fork of YPIR: High-Throughput Single-Server PIR with Silent Preprocessing"
 license = "MIT OR Apache-2.0"
@@ -22,7 +22,7 @@ http_client = ["reqwest"]
 cli = ["dep:clap", "dep:env_logger"]
 
 [dependencies]
-spiral-rs = { package = "valar-spiral-rs", version = "0.5" }
+spiral-rs = { package = "valar-spiral-rs", version = "=0.5.3-rc.1" }
 rayon = { version = "1", optional = true }
 rand = { version = "0.8.5", features = ["small_rng"] }
 rand_chacha = "0.3.1"
