@@ -1,0 +1,30 @@
+name: Container
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - build.rs
+      - src/**
+      - .github/workflows/container.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    name: Build and start container
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build the shipped image
+        run: docker build --tag ypir:ci .
+      - name: Check the executable starts
+        run: docker run --rm ypir:ci --help
